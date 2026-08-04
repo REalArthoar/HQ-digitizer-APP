@@ -25,12 +25,34 @@ import os
 import re
 
 from flask import Flask, render_template_string, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from markupsafe import Markup, escape
 from PIL import Image, ImageOps
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import anthropic
 
 app = Flask(__name__)
+
+# Render (like most hosts) sits your app behind a reverse proxy, so without
+# this, Flask sees the proxy's own IP for every single visitor instead of
+# each person's real IP — which would make the rate limit below either
+# useless (everyone shares one bucket) or wrong. This tells Flask to trust
+# the standard X-Forwarded-For header the proxy sets.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
+# Every hit to /transcribe costs real money (an Opus API call). Without a
+# limit, someone impatiently spam-clicking — or a bot — could burn through
+# the whole monthly budget in seconds and take the tool down for everyone
+# else. This caps how many transcriptions any single visitor (identified by
+# IP address) can request per minute and per day.
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    storage_uri="memory://",
+    default_limits=[],
+)
 
 # Reject uploads bigger than 25 MB outright — generous enough for a real
 # phone photo (which we then shrink below), while still blocking anything
@@ -188,7 +210,7 @@ UPLOAD_FORM = """
     <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
     <br>
     <input type="text" name="context" placeholder="Optional: language, topic, or hint (e.g. 'Lithuanian names and shift times')" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
-    <button type="submit">Transcribe it</button>
+    <button type="submit" id="submitBtn">Transcribe it</button>
   </form>
   <script>
     const dropzone = document.getElementById('dropzone');
@@ -242,11 +264,17 @@ UPLOAD_FORM = """
       }
     });
 
+    const submitBtn = document.getElementById('submitBtn');
     uploadForm.addEventListener('submit', (e) => {
       if (!photoInput.files.length) {
         e.preventDefault();
         alert('Please choose or drop a photo first.');
+        return;
       }
+      // Stop double/triple-clicking from firing multiple paid API calls
+      // while people wait for the (sometimes slow) first response.
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Reading your handwriting... (can take up to 30s)';
     });
   </script>
   <p class="contact-footer">Found a bug, or have an idea? Email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">{{ contact_email }}</a><br>
@@ -294,11 +322,11 @@ RESULT_PAGE = """
   <div class="fix-word-box">
     <h3>Got a specific word wrong?</h3>
     <p style="font-size:0.85em; color:#666; margin:0 0 6px;">Take or upload a close-up photo of just that part, tell us what we guessed, and we'll take a fresh, careful look at just that piece.</p>
-    <form method="post" enctype="multipart/form-data" action="/transcribe">
+    <form method="post" enctype="multipart/form-data" action="/transcribe" id="fixWordForm">
       <input type="file" name="photo" accept="image/*" required><br>
       <input type="text" name="previous_guess" placeholder="What did we get wrong? (e.g. 'Datos keistos')" required>
       <input type="text" name="context" placeholder="Optional: what it should probably say, or language hint">
-      <button type="submit">Re-read this part</button>
+      <button type="submit" id="fixWordBtn">Re-read this part</button>
     </form>
   </div>
 
@@ -315,6 +343,14 @@ RESULT_PAGE = """
         status.textContent = 'Copied!';
         setTimeout(() => { status.textContent = ''; }, 2000);
       });
+    });
+
+    // Same double-submit protection as the main upload form.
+    const fixWordForm = document.getElementById('fixWordForm');
+    const fixWordBtn = document.getElementById('fixWordBtn');
+    fixWordForm.addEventListener('submit', () => {
+      fixWordBtn.disabled = true;
+      fixWordBtn.textContent = 'Re-reading... (can take up to 30s)';
     });
   </script>
 </body>
@@ -514,6 +550,19 @@ def file_too_large(_error):
     ), 413
 
 
+@app.errorhandler(429)
+def rate_limited(_error):
+    return render_template_string(
+        ERROR_PAGE,
+        error=(
+            "You've sent a lot of requests in a short time, so this early "
+            "test is pausing you briefly to keep it available for everyone. "
+            "Please wait a minute (or try again tomorrow) and try again."
+        ),
+        contact_email=CONTACT_EMAIL,
+    ), 429
+
+
 @app.route("/")
 def index():
     return render_template_string(
@@ -522,6 +571,7 @@ def index():
 
 
 @app.route("/transcribe", methods=["POST"])
+@limiter.limit("5 per minute; 30 per day")
 def transcribe():
     uploaded_file = request.files.get("photo")
     if not uploaded_file or uploaded_file.filename == "":
