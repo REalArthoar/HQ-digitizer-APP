@@ -119,10 +119,12 @@ UPLOAD_FORM = """
     .tips p.tips-title { font-weight: bold; margin: 0 0 8px; text-align: center; }
     .tips ul { margin: 0; padding-left: 20px; }
     .tips li { margin-bottom: 6px; }
+    .notice { font-size: 0.8em; color: #777; margin-bottom: 4px; }
   </style>
 </head>
 <body>
   <h1>Turn your handwriting into clean text</h1>
+  <p class="notice">This is an early test, not a finished product — thanks for trying it. First load (or after a few idle minutes) can take 10-30 seconds to wake up; that's normal.</p>
   <p class="promise">Your photo is read once, transcribed, and deleted immediately.
   It is never stored, never logged, and never used to train any model.</p>
   <div class="tips">
