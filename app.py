@@ -107,7 +107,8 @@ Rules:
 - Do not summarize, paraphrase, correct grammar, or "clean up" the writing.
 - If a word is genuinely illegible, write [illegible] in its place rather than guessing.
 - If you are unsure about a specific word but have a reasonable guess, write it followed by a question mark in brackets, like this: word[?]
-- If any text is crossed out or struck through in the photo, wrap just that word or phrase in double tildes, like this: ~~word~~
+- If any text is crossed out or struck through in the photo, wrap just that word or phrase in double tildes, like this: ~~word~~. Crossed-out text is often written faster and messier than the rest — take the same care reading it as anything else, and use word[?] instead of guessing if you're not genuinely confident.
+- If the handwriting contains a table, grid, or calendar-like structure with clear rows and columns, represent it as a markdown table: a header row and each data row wrapped in | pipes |, with a |---|---| separator row directly under the header. Keep the number of columns consistent with what's actually in the photo.
 - Preserve the layout as closely as possible (line breaks, bullet points, indentation).
 - Return ONLY the transcription. No commentary, no "Here is the transcription:", nothing else.
 """
@@ -249,7 +250,7 @@ RESULT_PAGE = """
     body { font-family: sans-serif; max-width: 1000px; margin: 40px auto; }
     .columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
     .columns img { max-width: 460px; max-height: 80vh; border-radius: 8px; border: 1px solid #ddd; }
-    pre { white-space: pre-wrap; background: #f4f4f4; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; }
+    .result-content { background: #f4f4f4; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
     .promise { color: #2a6f2a; font-size: 0.9em; }
   </style>
 </head>
@@ -258,7 +259,7 @@ RESULT_PAGE = """
   <p>Compare side by side to check the AI matched the right words to the right part of the page:</p>
   <div class="columns">
     <img src="data:{{ media_type }};base64,{{ image_b64 }}" alt="Your uploaded photo">
-    <pre>{{ text }}</pre>
+    <div class="result-content">{{ text }}</div>
   </div>
   <p class="promise">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
   Once you leave or refresh this page, it's gone for good.</p>
@@ -301,17 +302,80 @@ def friendly_error_message(exc: Exception) -> str:
     )
 
 
-def format_transcription(raw_text: str) -> Markup:
-    """Turn the AI's ~~word~~ markers into real strikethrough, safely.
+def _inline_format(segment: str) -> str:
+    """Escape a piece of text safely, then turn ~~word~~ into real strikethrough."""
+    escaped = str(escape(segment))
+    return re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped)
 
-    We escape the raw text first (so any stray < > & the AI transcribed
-    can't break the page or inject anything), then convert our own
-    ~~word~~ marker into an actual <s> tag afterwards — the marker uses
-    only plain characters, so escaping doesn't touch it.
+
+def _is_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_separator_row(line: str) -> bool:
+    if not _is_table_row(line):
+        return False
+    cells = line.strip().strip("|").split("|")
+    return all(re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells)
+
+
+def format_transcription(raw_text: str) -> Markup:
+    """Turn the AI's transcription into readable HTML.
+
+    Two things handled here:
+    - ~~word~~ becomes real strikethrough, for crossed-out text.
+    - A markdown-style table (| col | col |, with a --- separator row) gets
+      converted into an actual HTML <table> instead of showing raw pipe
+      characters as plain text — much closer to what a real grid or
+      calendar on the original page actually looks like.
     """
-    escaped = str(escape(raw_text))
-    with_strikethrough = re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped)
-    return Markup(with_strikethrough)
+    lines = raw_text.split("\n")
+    html_parts: list[str] = []
+    plain_buffer: list[str] = []
+    i = 0
+    n = len(lines)
+
+    def flush_plain() -> None:
+        if plain_buffer:
+            joined = "\n".join(plain_buffer)
+            html_parts.append(
+                f'<div style="white-space: pre-wrap; margin: 4px 0;">{_inline_format(joined)}</div>'
+            )
+            plain_buffer.clear()
+
+    while i < n:
+        line = lines[i]
+        if _is_table_row(line) and i + 1 < n and _is_separator_row(lines[i + 1]):
+            flush_plain()
+            header_cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            i += 2  # skip header row + separator row
+            rows = []
+            while i < n and _is_table_row(lines[i]):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+
+            table_html = ['<table style="border-collapse: collapse; margin: 10px 0;">', "<tr>"]
+            table_html += [
+                f'<th style="border:1px solid #ccc; padding:5px 10px; background:#f0f0f0;">{_inline_format(c)}</th>'
+                for c in header_cells
+            ]
+            table_html.append("</tr>")
+            for row in rows:
+                table_html.append("<tr>")
+                table_html += [
+                    f'<td style="border:1px solid #ccc; padding:5px 10px;">{_inline_format(c)}</td>'
+                    for c in row
+                ]
+                table_html.append("</tr>")
+            table_html.append("</table>")
+            html_parts.append("".join(table_html))
+        else:
+            plain_buffer.append(line)
+            i += 1
+
+    flush_plain()
+    return Markup("".join(html_parts))
 
 
 @app.errorhandler(413)
