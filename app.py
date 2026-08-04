@@ -231,7 +231,7 @@ UPLOAD_FORM = """
       }
     });
   </script>
-  <p class="contact-footer">Found a bug, or have an idea? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">Email me — I'd genuinely love to hear it</a>.</p>
+  <p class="contact-footer">Found a bug, or have an idea? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">Email me</a> — or just copy: <strong>{{ contact_email }}</strong></p>
 </body>
 </html>
 """
@@ -258,7 +258,7 @@ RESULT_PAGE = """
   <p class="promise">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
   Once you leave or refresh this page, it's gone for good.</p>
   <a href="/">Try another page</a>
-  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">Let me know</a> — real examples help a lot.</p>
+  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">Let me know</a> — or copy: <strong>{{ contact_email }}</strong></p>
 </body>
 </html>
 """
@@ -269,7 +269,7 @@ ERROR_PAGE = """
   <h1>Something went wrong</h1>
   <p>{{ error }}</p>
   <a href="/">Go back</a>
-  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">email me about it</a> — happy to fix it.</p>
+  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">email me</a> — or copy: <strong>{{ contact_email }}</strong></p>
 </body></html>
 """
 
