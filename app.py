@@ -47,6 +47,10 @@ MAX_CONTEXT_LENGTH = 300  # characters — keeps the optional hint from ballooni
 # have an easy way to reach a real person instead of just giving up silently.
 CONTACT_EMAIL = "deividunas11@gmail.com"
 
+# Optional, no-pressure way for people to help cover API/hosting costs.
+# Never blocks or limits anything — purely there for whoever wants to use it.
+KOFI_URL = "https://ko-fi.com/realarthoar"
+
 
 def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     """Resize large photos down to a sensible size and re-encode as JPEG.
@@ -231,7 +235,8 @@ UPLOAD_FORM = """
       }
     });
   </script>
-  <p class="contact-footer">Found a bug, or have an idea? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">Email me</a> — or just copy: <strong>{{ contact_email }}</strong></p>
+  <p class="contact-footer">Found a bug, or have an idea? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">Email me</a> — or just copy: <strong>{{ contact_email }}</strong><br>
+  Free tool, running on my own budget — <a href="{{ kofi_url }}" target="_blank" rel="noopener">Ko-fi tip jar</a> if you ever want to help out.</p>
 </body>
 </html>
 """
@@ -258,7 +263,8 @@ RESULT_PAGE = """
   <p class="promise">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
   Once you leave or refresh this page, it's gone for good.</p>
   <a href="/">Try another page</a>
-  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">Let me know</a> — or copy: <strong>{{ contact_email }}</strong></p>
+  <p style="margin-top: 20px; font-size: 0.85em; color: #999;">This is a free early test, running on my own budget for API and hosting costs. If it saved you some time, you're welcome to <a href="{{ kofi_url }}" target="_blank" rel="noopener" style="color: #3a7bd5;">chip in on Ko-fi</a> — never required, just appreciated.</p>
+  <p style="font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">Let me know</a> — or copy: <strong>{{ contact_email }}</strong></p>
 </body>
 </html>
 """
@@ -319,7 +325,9 @@ def file_too_large(_error):
 
 @app.route("/")
 def index():
-    return render_template_string(UPLOAD_FORM, contact_email=CONTACT_EMAIL)
+    return render_template_string(
+        UPLOAD_FORM, contact_email=CONTACT_EMAIL, kofi_url=KOFI_URL
+    )
 
 
 @app.route("/transcribe", methods=["POST"])
@@ -394,6 +402,7 @@ def transcribe():
         image_b64=image_b64,
         media_type=media_type,
         contact_email=CONTACT_EMAIL,
+        kofi_url=KOFI_URL,
     )
     del original_bytes
     del image_bytes
