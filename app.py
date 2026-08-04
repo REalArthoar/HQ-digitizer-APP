@@ -120,6 +120,21 @@ UPLOAD_FORM = """
     .tips ul { margin: 0; padding-left: 20px; }
     .tips li { margin-bottom: 6px; }
     .notice { font-size: 0.8em; color: #777; margin-bottom: 4px; }
+    .dropzone {
+      border: 2px dashed #aaa;
+      border-radius: 10px;
+      padding: 30px 16px;
+      margin: 16px 0 4px;
+      cursor: pointer;
+      color: #555;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .dropzone.dragover { background: #eef6ff; border-color: #3a7bd5; color: #3a7bd5; }
+    .dropzone .filename { font-weight: bold; margin-top: 8px; color: #2a6f2a; }
+    .camera-btn {
+      display: inline-block; margin-top: 8px; font-size: 0.85em;
+      color: #3a7bd5; text-decoration: underline; cursor: pointer; background: none; border: none;
+    }
   </style>
 </head>
 <body>
@@ -139,11 +154,77 @@ UPLOAD_FORM = """
       <li>Clarity matters more than megapixels — a sharp, well-lit ordinary photo beats a blurry high-res one</li>
     </ul>
   </div>
-  <form method="post" enctype="multipart/form-data" action="/transcribe">
-    <input type="file" name="photo" accept="image/*" required><br>
+  <form method="post" enctype="multipart/form-data" action="/transcribe" id="uploadForm">
+    <div class="dropzone" id="dropzone">
+      <div id="dropzoneText">Drag &amp; drop a photo here, or click to browse</div>
+      <div class="filename" id="filenameLabel"></div>
+    </div>
+    <input type="file" name="photo" id="photoInput" accept="image/*" required style="display:none;">
+    <button type="button" class="camera-btn" id="cameraBtn">Or take a photo now</button>
+    <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
+    <br>
     <input type="text" name="context" placeholder="Optional: language, topic, or hint (e.g. 'Lithuanian names and shift times')" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
     <button type="submit">Transcribe it</button>
   </form>
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const photoInput = document.getElementById('photoInput');
+    const cameraInput = document.getElementById('cameraInput');
+    const cameraBtn = document.getElementById('cameraBtn');
+    const filenameLabel = document.getElementById('filenameLabel');
+    const dropzoneText = document.getElementById('dropzoneText');
+    const uploadForm = document.getElementById('uploadForm');
+
+    function showChosenFile(file) {
+      filenameLabel.textContent = file ? file.name : '';
+      dropzoneText.textContent = file ? 'Photo selected — click to change' : 'Drag & drop a photo here, or click to browse';
+    }
+
+    // Click the dropzone to open the normal file picker.
+    dropzone.addEventListener('click', () => photoInput.click());
+
+    photoInput.addEventListener('change', () => {
+      if (photoInput.files.length) showChosenFile(photoInput.files[0]);
+    });
+
+    // Drag-and-drop support.
+    ['dragenter', 'dragover'].forEach(evt =>
+      dropzone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropzone.classList.add('dragover');
+      })
+    );
+    ['dragleave', 'drop'].forEach(evt =>
+      dropzone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+      })
+    );
+    dropzone.addEventListener('drop', (e) => {
+      const files = e.dataTransfer.files;
+      if (files.length) {
+        photoInput.files = files;
+        showChosenFile(files[0]);
+      }
+    });
+
+    // "Take a photo now" opens the camera directly (mobile), then copies
+    // the result into the same field the form actually submits.
+    cameraBtn.addEventListener('click', () => cameraInput.click());
+    cameraInput.addEventListener('change', () => {
+      if (cameraInput.files.length) {
+        photoInput.files = cameraInput.files;
+        showChosenFile(cameraInput.files[0]);
+      }
+    });
+
+    uploadForm.addEventListener('submit', (e) => {
+      if (!photoInput.files.length) {
+        e.preventDefault();
+        alert('Please choose or drop a photo first.');
+      }
+    });
+  </script>
 </body>
 </html>
 """
