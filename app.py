@@ -391,28 +391,26 @@ def _is_separator_row(line: str) -> bool:
     return all(re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells)
 
 
-def format_transcription(raw_text: str) -> Markup:
-    """Turn the AI's transcription into readable HTML.
+def _parse_blocks(raw_text: str) -> list[tuple]:
+    """Split the AI's raw output into a sequence of blocks.
 
-    Two things handled here:
-    - ~~word~~ becomes real strikethrough, for crossed-out text.
-    - A markdown-style table (| col | col |, with a --- separator row) gets
-      converted into an actual HTML <table> instead of showing raw pipe
-      characters as plain text — much closer to what a real grid or
-      calendar on the original page actually looks like.
+    Each block is either:
+    - ("table", header_cells, rows)  — a detected markdown table
+    - ("text", lines)                — everything else, as-is
+
+    Both format_transcription() (HTML) and clean_text_for_copy() (plain
+    text) are built on top of this shared parser, so table-detection logic
+    only lives in one place.
     """
     lines = raw_text.split("\n")
-    html_parts: list[str] = []
+    blocks: list[tuple] = []
     plain_buffer: list[str] = []
     i = 0
     n = len(lines)
 
     def flush_plain() -> None:
         if plain_buffer:
-            joined = "\n".join(plain_buffer)
-            html_parts.append(
-                f'<div style="white-space: pre-wrap; margin: 4px 0;">{_inline_format(joined)}</div>'
-            )
+            blocks.append(("text", list(plain_buffer)))
             plain_buffer.clear()
 
     while i < n:
@@ -425,7 +423,30 @@ def format_transcription(raw_text: str) -> Markup:
             while i < n and _is_table_row(lines[i]):
                 rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
                 i += 1
+            blocks.append(("table", header_cells, rows))
+        else:
+            plain_buffer.append(line)
+            i += 1
 
+    flush_plain()
+    return blocks
+
+
+def format_transcription(raw_text: str) -> Markup:
+    """Turn the AI's transcription into readable HTML.
+
+    Two things handled here:
+    - ~~word~~ becomes real strikethrough, for crossed-out text.
+    - A markdown-style table (| col | col |, with a --- separator row) gets
+      converted into an actual HTML <table> instead of showing raw pipe
+      characters as plain text — much closer to what a real grid or
+      calendar on the original page actually looks like.
+    """
+    html_parts: list[str] = []
+
+    for block in _parse_blocks(raw_text):
+        if block[0] == "table":
+            _, header_cells, rows = block
             table_html = ['<table style="border-collapse: collapse; margin: 10px 0;">', "<tr>"]
             table_html += [
                 f'<th style="border:1px solid #ccc; padding:5px 10px; background:#f0f0f0;">{_inline_format(c)}</th>'
@@ -442,11 +463,46 @@ def format_transcription(raw_text: str) -> Markup:
             table_html.append("</table>")
             html_parts.append("".join(table_html))
         else:
-            plain_buffer.append(line)
-            i += 1
+            _, lines = block
+            joined = "\n".join(lines)
+            html_parts.append(
+                f'<div style="white-space: pre-wrap; margin: 4px 0;">{_inline_format(joined)}</div>'
+            )
 
-    flush_plain()
     return Markup("".join(html_parts))
+
+
+def clean_text_for_copy(raw_text: str) -> str:
+    """Build the plain-text version used in the editable/copyable box.
+
+    The AI's raw output uses markdown syntax (| pipes | for tables, ~~word~~
+    for crossed-out text) that's meant to be *parsed*, not read directly —
+    pasted straight into Notepad or an email it looks like broken code.
+
+    So instead of showing that raw syntax, we convert it into something
+    that actually looks clean when pasted elsewhere:
+    - Tables become tab-separated rows. Tabs are invisible in a plain text
+      editor (looks like simple spaced-out columns) but are also exactly
+      what Excel, Google Sheets, and Word recognize as "paste this as a
+      real table" — so it's an upgrade, not just a cosmetic fix.
+    - ~~word~~ markers are stripped, since the strikethrough styling only
+      makes sense visually on the result page itself.
+    - [illegible] and word[?] are left as-is — those are meaningful notes
+      a reader should still see even outside this page.
+    """
+    out_lines: list[str] = []
+
+    for block in _parse_blocks(raw_text):
+        if block[0] == "table":
+            _, header_cells, rows = block
+            out_lines.append("\t".join(header_cells))
+            for row in rows:
+                out_lines.append("\t".join(row))
+        else:
+            _, lines = block
+            out_lines.extend(line.replace("~~", "") for line in lines)
+
+    return "\n".join(out_lines)
 
 
 @app.errorhandler(413)
@@ -535,7 +591,7 @@ def transcribe():
     response = render_template_string(
         RESULT_PAGE,
         text=format_transcription(text),
-        raw_text=text,
+        raw_text=clean_text_for_copy(text),
         image_b64=image_b64,
         media_type=media_type,
         contact_email=CONTACT_EMAIL,
