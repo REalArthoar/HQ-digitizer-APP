@@ -91,7 +91,7 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
 # environment variable instead (see README.md).
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-def build_prompt(context_hint: str) -> str:
+def build_prompt(context_hint: str, previous_guess: str = "") -> str:
     hint_line = ""
     if context_hint.strip():
         hint_line = (
@@ -100,8 +100,21 @@ def build_prompt(context_hint: str) -> str:
             "but still transcribe only what is actually written.\n"
         )
 
+    rethink_line = ""
+    if previous_guess.strip():
+        rethink_line = f"""
+This is a close-up crop of a small piece of handwriting that was hard to read.
+A previous automated attempt read it as: "{previous_guess.strip()}"
+That reading may be WRONG — do not simply repeat it. Look at the image fresh,
+as if you had never seen that guess. Only keep the same reading if, after
+genuinely careful re-examination of the letter shapes, you are confident it's
+correct. If a different reading now seems more likely, use that instead. If
+you're still not sure, use word[?] rather than defaulting back to the
+previous guess out of habit.
+"""
+
     return f"""You are transcribing a photo of handwritten text as accurately as possible.
-{hint_line}
+{hint_line}{rethink_line}
 Rules:
 - Transcribe EXACTLY what is written, preserving original spelling, punctuation, and line breaks.
 - Do not summarize, paraphrase, correct grammar, or "clean up" the writing.
@@ -252,6 +265,14 @@ RESULT_PAGE = """
     .columns img { max-width: 460px; max-height: 80vh; border-radius: 8px; border: 1px solid #ddd; }
     .result-content { background: #f4f4f4; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
     .promise { color: #2a6f2a; font-size: 0.9em; }
+    .legend { font-size: 0.8em; color: #666; margin-top: 6px; }
+    .legend span { color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px; }
+    .edit-box { margin-top: 24px; }
+    .edit-box textarea { width: 100%; min-height: 160px; font-family: monospace; font-size: 0.95em; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
+    .edit-box button { margin-top: 8px; padding: 6px 14px; cursor: pointer; }
+    .fix-word-box { margin-top: 30px; padding: 14px 18px; background: #f9f9f9; border-radius: 8px; border: 1px solid #eee; }
+    .fix-word-box h3 { margin: 0 0 8px; font-size: 1em; }
+    .fix-word-box input[type=text] { width: 90%; padding: 6px; margin: 6px 0; }
   </style>
 </head>
 <body>
@@ -261,11 +282,41 @@ RESULT_PAGE = """
     <img src="data:{{ media_type }};base64,{{ image_b64 }}" alt="Your uploaded photo">
     <div class="result-content">{{ text }}</div>
   </div>
-  <p class="promise">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
+  <p class="legend"><span>Highlighted text</span> means the AI wasn't fully confident — worth double-checking against the photo.</p>
+
+  <div class="edit-box">
+    <p style="font-size:0.9em; color:#555; margin-bottom:4px;">Edit or copy the plain text below — no need to leave this page:</p>
+    <textarea id="editableText">{{ raw_text }}</textarea><br>
+    <button type="button" id="copyBtn">Copy text</button>
+    <span id="copyStatus" style="font-size:0.85em; color:#2a6f2a; margin-left:8px;"></span>
+  </div>
+
+  <div class="fix-word-box">
+    <h3>Got a specific word wrong?</h3>
+    <p style="font-size:0.85em; color:#666; margin:0 0 6px;">Take or upload a close-up photo of just that part, tell us what we guessed, and we'll take a fresh, careful look at just that piece.</p>
+    <form method="post" enctype="multipart/form-data" action="/transcribe">
+      <input type="file" name="photo" accept="image/*" required><br>
+      <input type="text" name="previous_guess" placeholder="What did we get wrong? (e.g. 'Datos keistos')" required>
+      <input type="text" name="context" placeholder="Optional: what it should probably say, or language hint">
+      <button type="submit">Re-read this part</button>
+    </form>
+  </div>
+
+  <p class="promise" style="margin-top:24px;">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
   Once you leave or refresh this page, it's gone for good.</p>
   <a href="/">Try another page</a>
   <p style="margin-top: 20px; font-size: 0.85em; color: #999;">This is a free early test, running on my own budget for API and hosting costs. Never required, just appreciated: <a href="{{ kofi_url }}" target="_blank" rel="noopener" style="color: #3a7bd5;">{{ kofi_url }}</a></p>
   <p style="font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? Email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">{{ contact_email }}</a></p>
+  <script>
+    document.getElementById('copyBtn').addEventListener('click', () => {
+      const textarea = document.getElementById('editableText');
+      navigator.clipboard.writeText(textarea.value).then(() => {
+        const status = document.getElementById('copyStatus');
+        status.textContent = 'Copied!';
+        setTimeout(() => { status.textContent = ''; }, 2000);
+      });
+    });
+  </script>
 </body>
 </html>
 """
@@ -302,9 +353,29 @@ def friendly_error_message(exc: Exception) -> str:
     )
 
 
+UNCERTAIN_STYLE = 'color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px;'
+
+
 def _inline_format(segment: str) -> str:
-    """Escape a piece of text safely, then turn ~~word~~ into real strikethrough."""
+    """Escape a piece of text safely, then apply our own formatting markers.
+
+    Order matters here:
+    1. Highlight [illegible] and word[?] in red first, while the text is
+       still plain — so the AI's uncertainty is impossible to miss.
+    2. Apply ~~word~~ strikethrough last, since its regex can safely wrap
+       around the <span> tags already inserted by step 1.
+    """
     escaped = str(escape(segment))
+    escaped = re.sub(
+        r"\[illegible\]",
+        f'<span style="{UNCERTAIN_STYLE}" title="The AI could not read this — check the photo">[illegible]</span>',
+        escaped,
+    )
+    escaped = re.sub(
+        r"(\S+?\[\?\])",
+        rf'<span style="{UNCERTAIN_STYLE}" title="The AI was not fully sure about this — double check it">\1</span>',
+        escaped,
+    )
     return re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped)
 
 
@@ -416,6 +487,7 @@ def transcribe():
     image_bytes, media_type = shrink_image_if_needed(original_bytes)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
+    previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
 
     try:
         message = client.messages.create(
@@ -438,7 +510,7 @@ def transcribe():
                         },
                         {
                             "type": "text",
-                            "text": build_prompt(context_hint),
+                            "text": build_prompt(context_hint, previous_guess),
                         },
                     ],
                 }
@@ -463,6 +535,7 @@ def transcribe():
     response = render_template_string(
         RESULT_PAGE,
         text=format_transcription(text),
+        raw_text=text,
         image_b64=image_b64,
         media_type=media_type,
         contact_email=CONTACT_EMAIL,
