@@ -43,6 +43,10 @@ MAX_IMAGE_DIMENSION = 2000  # pixels, longest edge
 
 MAX_CONTEXT_LENGTH = 300  # characters — keeps the optional hint from ballooning cost
 
+# Where feedback, bug reports, and ideas go. Shown on every page so testers
+# have an easy way to reach a real person instead of just giving up silently.
+CONTACT_EMAIL = "deividunas11@gmail.com"
+
 
 def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     """Resize large photos down to a sensible size and re-encode as JPEG.
@@ -135,6 +139,8 @@ UPLOAD_FORM = """
       display: inline-block; margin-top: 8px; font-size: 0.85em;
       color: #3a7bd5; text-decoration: underline; cursor: pointer; background: none; border: none;
     }
+    .contact-footer { margin-top: 30px; font-size: 0.85em; color: #999; }
+    .contact-footer a { color: #3a7bd5; }
   </style>
 </head>
 <body>
@@ -225,6 +231,7 @@ UPLOAD_FORM = """
       }
     });
   </script>
+  <p class="contact-footer">Found a bug, or have an idea? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">Email me — I'd genuinely love to hear it</a>.</p>
 </body>
 </html>
 """
@@ -251,6 +258,7 @@ RESULT_PAGE = """
   <p class="promise">This photo was never saved to disk — it's only shown here, in your own browser, for this one page.
   Once you leave or refresh this page, it's gone for good.</p>
   <a href="/">Try another page</a>
+  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">Let me know</a> — real examples help a lot.</p>
 </body>
 </html>
 """
@@ -261,8 +269,30 @@ ERROR_PAGE = """
   <h1>Something went wrong</h1>
   <p>{{ error }}</p>
   <a href="/">Go back</a>
+  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">email me about it</a> — happy to fix it.</p>
 </body></html>
 """
+
+
+def friendly_error_message(exc: Exception) -> str:
+    """Translate technical/API errors into something a stranger can understand.
+
+    We never want a random tester to see a raw API error dump — it looks
+    broken even when it's actually something simple like "the monthly
+    budget cap was reached."
+    """
+    text = str(exc).lower()
+    if "credit" in text or "balance" in text:
+        return (
+            "This early test has hit its monthly usage budget. "
+            "Please check back later, or let the person who shared this link know!"
+        )
+    if "rate limit" in text or "429" in text:
+        return "This tool is getting a lot of use right now — please wait a minute and try again."
+    return (
+        "Something went wrong reading that photo. Please try again, "
+        "or try a different photo if this keeps happening."
+    )
 
 
 def format_transcription(raw_text: str) -> Markup:
@@ -283,25 +313,29 @@ def file_too_large(_error):
     return render_template_string(
         ERROR_PAGE,
         error="That file is too large (25 MB limit). Try a different photo.",
+        contact_email=CONTACT_EMAIL,
     ), 413
 
 
 @app.route("/")
 def index():
-    return UPLOAD_FORM
+    return render_template_string(UPLOAD_FORM, contact_email=CONTACT_EMAIL)
 
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     uploaded_file = request.files.get("photo")
     if not uploaded_file or uploaded_file.filename == "":
-        return render_template_string(ERROR_PAGE, error="No photo was uploaded.")
+        return render_template_string(
+            ERROR_PAGE, error="No photo was uploaded.", contact_email=CONTACT_EMAIL
+        )
 
     media_type = uploaded_file.mimetype or ""
     if not media_type.startswith("image/"):
         return render_template_string(
             ERROR_PAGE,
             error=f"That doesn't look like an image file ({media_type or 'unknown type'}). Please upload a photo.",
+            contact_email=CONTACT_EMAIL,
         )
 
     # Read the image straight into memory. We never call uploaded_file.save(),
@@ -347,8 +381,10 @@ def transcribe():
         )
         if text is None:
             raise ValueError("The model didn't return any readable text.")
-    except Exception as exc:  # noqa: BLE001 — show the user something readable
-        return render_template_string(ERROR_PAGE, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — never show a raw technical error to a stranger
+        return render_template_string(
+            ERROR_PAGE, error=friendly_error_message(exc), contact_email=CONTACT_EMAIL
+        )
 
     # Rendered once, straight back into this response — never written to a
     # file, database, or log. It exists only in this one page load.
@@ -357,6 +393,7 @@ def transcribe():
         text=format_transcription(text),
         image_b64=image_b64,
         media_type=media_type,
+        contact_email=CONTACT_EMAIL,
     )
     del original_bytes
     del image_bytes
