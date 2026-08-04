@@ -186,8 +186,10 @@ UPLOAD_FORM = """
 <body>
   <h1>Turn your handwriting into clean text</h1>
   <p class="notice">This is an early test, not a finished product — thanks for trying it. First load (or after a few idle minutes) can take 10-30 seconds to wake up; that's normal.</p>
-  <p class="promise">Your photo is read once, transcribed, and deleted immediately.
-  It is never stored, never logged, and never used to train any model.</p>
+  <p class="promise">Your photo is read once, transcribed, and never saved on our end.
+  Our API provider briefly processes it to read the handwriting, never uses it
+  to train any model or shares it — and automatically deletes their own copy
+  within 30 days.</p>
   <div class="tips">
     <p class="tips-title">For the best result</p>
     <ul>
