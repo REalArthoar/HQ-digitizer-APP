@@ -508,19 +508,24 @@ def format_transcription(raw_text: str) -> Markup:
     return Markup("".join(html_parts))
 
 
+TABLE_COLUMN_GAP = "   "  # 3 spaces of breathing room between copied table columns
+
+
 def clean_text_for_copy(raw_text: str) -> str:
     """Build the plain-text version used in the editable/copyable box.
 
     The AI's raw output uses markdown syntax (| pipes | for tables, ~~word~~
     for crossed-out text) that's meant to be *parsed*, not read directly —
-    pasted straight into Notepad or an email it looks like broken code.
+    pasted straight into Notepad or a note app it looks like broken code.
 
     So instead of showing that raw syntax, we convert it into something
     that actually looks clean when pasted elsewhere:
-    - Tables become tab-separated rows. Tabs are invisible in a plain text
-      editor (looks like simple spaced-out columns) but are also exactly
-      what Excel, Google Sheets, and Word recognize as "paste this as a
-      real table" — so it's an upgrade, not just a cosmetic fix.
+    - Table columns are padded with spaces to a fixed width per column, so
+      they line up cleanly in ANY plain text editor. (Tabs looked tidy in
+      the browser textarea but only jump to an editor's next fixed
+      tab-stop — a longer word in one row pushes everything after it
+      further right than a shorter word in the row above, which is exactly
+      the jagged, hard-to-read mess this was producing elsewhere.)
     - ~~word~~ markers are stripped, since the strikethrough styling only
       makes sense visually on the result page itself.
     - [illegible] and word[?] are left as-is — those are meaningful notes
@@ -531,9 +536,25 @@ def clean_text_for_copy(raw_text: str) -> str:
     for block in _parse_blocks(raw_text):
         if block[0] == "table":
             _, header_cells, rows = block
-            out_lines.append("\t".join(header_cells))
-            for row in rows:
-                out_lines.append("\t".join(row))
+            all_rows = [header_cells] + rows
+            col_count = len(header_cells)
+            col_widths = [0] * col_count
+            for row in all_rows:
+                for idx in range(col_count):
+                    cell = row[idx] if idx < len(row) else ""
+                    col_widths[idx] = max(col_widths[idx], len(cell))
+
+            for row in all_rows:
+                padded_cells = []
+                for idx in range(col_count):
+                    cell = row[idx] if idx < len(row) else ""
+                    # Don't pad the last column — no point trailing spaces
+                    # after the final word on a line.
+                    if idx == col_count - 1:
+                        padded_cells.append(cell)
+                    else:
+                        padded_cells.append(cell.ljust(col_widths[idx]))
+                out_lines.append(TABLE_COLUMN_GAP.join(padded_cells))
         else:
             _, lines = block
             out_lines.extend(line.replace("~~", "") for line in lines)
