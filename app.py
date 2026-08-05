@@ -23,6 +23,7 @@ import base64
 import io
 import os
 import re
+import time
 
 from flask import Flask, render_template_string, request
 from flask_limiter import Limiter
@@ -402,6 +403,12 @@ def friendly_error_message(exc: Exception) -> str:
         )
     if "rate limit" in text or "429" in text:
         return "This tool is getting a lot of use right now — please wait a minute and try again."
+    if "overloaded" in text or "529" in text:
+        return (
+            "The AI service we use is briefly overloaded with demand from everyone "
+            "using it right now — this isn't about your photo. Please wait a few "
+            "seconds and try again."
+        )
     return (
         "Something went wrong reading that photo. Please try again, "
         "or try a different photo if this keeps happening."
@@ -636,32 +643,50 @@ def transcribe():
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
 
     try:
-        message = client.messages.create(
-            model="claude-opus-5",
-            # Generous headroom: Opus spends some of this budget "thinking"
-            # before it writes the actual transcription, so a dense full
-            # page of handwriting could get cut off with a smaller limit.
-            max_tokens=8192,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
+        # Anthropic's API occasionally returns a 529 "Overloaded" error
+        # during periods of high demand across ALL their customers — it's
+        # not caused by anything on our end, and it's usually gone within
+        # a few seconds. Rather than failing the person's request over a
+        # brief blip, retry a couple of times with a short pause first.
+        last_overload_error: anthropic.OverloadedError | None = None
+        message = None
+        for attempt in range(3):
+            try:
+                message = client.messages.create(
+                    model="claude-opus-5",
+                    # Generous headroom: Opus spends some of this budget
+                    # "thinking" before it writes the actual transcription,
+                    # so a dense full page of handwriting could get cut off
+                    # with a smaller limit.
+                    max_tokens=8192,
+                    messages=[
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": build_prompt(context_hint, previous_guess),
-                        },
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": image_b64,
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": build_prompt(context_hint, previous_guess),
+                                },
+                            ],
+                        }
                     ],
-                }
-            ],
-        )
+                )
+                break
+            except anthropic.OverloadedError as exc:
+                last_overload_error = exc
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # 2s, then 4s
+        if message is None:
+            raise last_overload_error
+
         # Opus sometimes returns a "thinking" block before the actual answer,
         # so we look for the first block that's actually text instead of
         # assuming it's content[0].
