@@ -118,7 +118,11 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=85)
         return output.getvalue(), "image/jpeg"
-    except Exception:  # noqa: BLE001 — any decode issue, just use the original
+    except Exception as exc:  # noqa: BLE001 — any decode issue, just use the original
+        # Same idea as above: log the real reason shrinking failed, so a
+        # pattern (e.g. one phone/format consistently failing) is visible
+        # in Render's logs instead of silently falling back every time.
+        app.logger.warning("Could not shrink image, using original: %s", exc)
         return image_bytes, "image/jpeg"
 
 # Your API key. Get one at https://console.anthropic.com — never put the
@@ -668,6 +672,11 @@ def transcribe():
         if text is None:
             raise ValueError("The model didn't return any readable text.")
     except Exception as exc:  # noqa: BLE001 — never show a raw technical error to a stranger
+        # The person sees a friendly message below, but we still need the
+        # REAL error somewhere so we can actually debug it — this prints
+        # the full technical error and traceback to Render's logs only,
+        # never to the visitor's screen.
+        app.logger.exception("Transcription failed: %s", exc)
         return render_template_string(
             ERROR_PAGE, error=friendly_error_message(exc), contact_email=CONTACT_EMAIL
         )
