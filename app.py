@@ -74,6 +74,16 @@ CONTACT_EMAIL = "deividunas11@gmail.com"
 # Never blocks or limits anything — purely there for whoever wants to use it.
 KOFI_URL = "https://ko-fi.com/realarthoar"
 
+# Our best model, used for every request by default.
+PRIMARY_MODEL = "claude-opus-5"
+# If Opus itself is overloaded even after retries, fall back to this one.
+# Different models are usually served with separate capacity, so Sonnet can
+# often still take a request when Opus can't. It's a real step down in
+# transcription precision from Opus, but a solid middle ground — good
+# accuracy for a fraction of the cost, and far better than Haiku for
+# reading messy handwriting carefully. Only ever used as a last resort.
+FALLBACK_MODEL = "claude-sonnet-5"
+
 
 def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     """Resize large photos down to a sensible size and re-encode as JPEG.
@@ -165,6 +175,49 @@ Rules:
 - Preserve the layout as closely as possible (line breaks, bullet points, indentation).
 - Return ONLY the transcription. No commentary, no "Here is the transcription:", nothing else.
 """
+
+
+def call_model_with_retries(model: str, media_type: str, image_b64: str, prompt: str, retries: int = 3):
+    """Ask a specific model to read the image, retrying through brief 529
+    "Overloaded" errors before giving up on that model.
+
+    Shared by both the primary (Opus) and fallback (Sonnet) attempts in the
+    /transcribe route below, so the retry/backoff logic only lives once.
+    Raises the last OverloadedError if every attempt for this model fails.
+    """
+    last_overload_error: anthropic.OverloadedError | None = None
+    for attempt in range(retries):
+        try:
+            return client.messages.create(
+                model=model,
+                # Generous headroom: the model spends some of this budget
+                # "thinking" before it writes the actual transcription, so a
+                # dense full page of handwriting could get cut off with a
+                # smaller limit.
+                max_tokens=8192,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": image_b64,
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            )
+        except anthropic.OverloadedError as exc:
+            last_overload_error = exc
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))  # 2s, then 4s, ...
+    raise last_overload_error
+
 
 UPLOAD_FORM = """
 <!doctype html>
@@ -331,6 +384,12 @@ RESULT_PAGE = """
     <div class="result-content">{{ text }}</div>
   </div>
   <p class="legend"><span>Highlighted text</span> means the AI wasn't fully confident — worth double-checking against the photo.</p>
+  {% if used_fallback_model %}
+  <p style="font-size:0.85em; color:#a06a00; background:#fff8e6; padding:8px 12px; border-radius:6px; margin-top:10px;">
+    Our usual AI was briefly overloaded with demand, so this one read was done with a backup model instead.
+    It may be very slightly less precise than usual — worth a quick double-check, and feel free to re-try in a bit for our best model.
+  </p>
+  {% endif %}
 
   <div class="edit-box">
     <p style="font-size:0.9em; color:#555; margin-bottom:4px;">Edit or copy the plain text below — no need to leave this page:</p>
@@ -642,50 +701,22 @@ def transcribe():
     context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
 
+    prompt = build_prompt(context_hint, previous_guess)
+    used_fallback_model = False
+
     try:
-        # Anthropic's API occasionally returns a 529 "Overloaded" error
-        # during periods of high demand across ALL their customers — it's
-        # not caused by anything on our end, and it's usually gone within
-        # a few seconds. Rather than failing the person's request over a
-        # brief blip, retry a couple of times with a short pause first.
-        last_overload_error: anthropic.OverloadedError | None = None
-        message = None
-        for attempt in range(3):
-            try:
-                message = client.messages.create(
-                    model="claude-opus-5",
-                    # Generous headroom: Opus spends some of this budget
-                    # "thinking" before it writes the actual transcription,
-                    # so a dense full page of handwriting could get cut off
-                    # with a smaller limit.
-                    max_tokens=8192,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": image_b64,
-                                    },
-                                },
-                                {
-                                    "type": "text",
-                                    "text": build_prompt(context_hint, previous_guess),
-                                },
-                            ],
-                        }
-                    ],
-                )
-                break
-            except anthropic.OverloadedError as exc:
-                last_overload_error = exc
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))  # 2s, then 4s
-        if message is None:
-            raise last_overload_error
+        try:
+            message = call_model_with_retries(PRIMARY_MODEL, media_type, image_b64, prompt)
+        except anthropic.OverloadedError:
+            # Our best model is still overloaded even after its own
+            # retries — rather than fail the request outright, try once
+            # more on a different model. It's usually served with separate
+            # capacity, so it can often succeed even when Opus can't.
+            app.logger.warning(
+                "Opus overloaded after retries, falling back to %s", FALLBACK_MODEL
+            )
+            message = call_model_with_retries(FALLBACK_MODEL, media_type, image_b64, prompt, retries=2)
+            used_fallback_model = True
 
         # Opus sometimes returns a "thinking" block before the actual answer,
         # so we look for the first block that's actually text instead of
@@ -716,6 +747,7 @@ def transcribe():
         media_type=media_type,
         contact_email=CONTACT_EMAIL,
         kofi_url=KOFI_URL,
+        used_fallback_model=used_fallback_model,
     )
     del original_bytes
     del image_bytes
