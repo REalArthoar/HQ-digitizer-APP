@@ -88,6 +88,19 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     """
     try:
         image = Image.open(io.BytesIO(image_bytes))
+        # Modern phones can shoot 40+ megapixel photos. Without this line,
+        # PIL would decode that huge original at full size into memory
+        # FIRST, and only shrink it afterward — on a real test photo, that
+        # single decode step used more memory than the server had (512MB),
+        # crashing the whole app with an out-of-memory error before the
+        # photo even got as far as being read. draft() tells the JPEG
+        # decoder to do its own fast downscaling *during* decoding instead,
+        # so the huge full-size version never gets fully loaded into memory
+        # in the first place. It only ever hands back something >= the size
+        # we ask for, so the precise resize below still produces the same
+        # final quality — this only touches memory use, not image quality.
+        # (No effect on non-JPEG formats; harmless no-op for those.)
+        image.draft("RGB", (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
         # Phone photos often store pixels sideways/upside-down and rely on an
         # invisible "please rotate this" tag to display correctly. Since we
         # re-save the image below (which drops that tag), we have to bake
