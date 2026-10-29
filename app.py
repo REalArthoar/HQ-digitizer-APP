@@ -17,6 +17,15 @@ v2 changes (after first real test came back low quality):
   reading messy/cursive handwriting than the model used in v1.
 - Rewrote the prompt to be much more explicit about accuracy, uncertain
   words, and preserving structure instead of "cleaning it up."
+
+v3 changes (October 2026 check-up):
+- Upgraded to Opus 5.5 / Sonnet 5.5, the current model generation.
+- iPhone HEIC photos are now read properly (via pillow-heif) instead of
+  being sent to the AI mislabeled as JPEG and failing.
+- If a photo truly can't be opened, the visitor gets a clear "try a JPG or
+  PNG" message instead of a vague error after a wasted API call.
+- Package versions pinned in requirements.txt so a surprise upstream
+  release can't break a redeploy.
 """
 
 import base64
@@ -30,9 +39,15 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from markupsafe import Markup, escape
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import anthropic
+
+# iPhones save photos as HEIC by default. Pillow can't open those on its
+# own — this one line teaches it how, so iPhone photos get shrunk and
+# converted to JPEG like everything else.
+register_heif_opener()
 
 app = Flask(__name__)
 
@@ -75,14 +90,18 @@ CONTACT_EMAIL = "deividunas11@gmail.com"
 KOFI_URL = "https://ko-fi.com/realarthoar"
 
 # Our best model, used for every request by default.
-PRIMARY_MODEL = "claude-opus-5"
+PRIMARY_MODEL = "claude-opus-5-5"
 # If Opus itself is overloaded even after retries, fall back to this one.
 # Different models are usually served with separate capacity, so Sonnet can
 # often still take a request when Opus can't. It's a real step down in
 # transcription precision from Opus, but a solid middle ground — good
 # accuracy for a fraction of the cost, and far better than Haiku for
 # reading messy handwriting carefully. Only ever used as a last resort.
-FALLBACK_MODEL = "claude-sonnet-5"
+FALLBACK_MODEL = "claude-sonnet-5-5"
+
+
+class UnreadableImageError(Exception):
+    """The uploaded file couldn't be opened as an image at all."""
 
 
 def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
@@ -93,9 +112,11 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     and it's why the size limit above can stay generous instead of
     rejecting people's real photos.
 
-    If anything about the image can't be read (corrupt file, odd format),
-    we fall back to sending the original bytes untouched rather than
-    failing the whole request.
+    If the image can't be opened at all (corrupt file, unsupported format),
+    this raises UnreadableImageError. It used to send the original bytes
+    anyway, labeled as JPEG — but the AI service rejects mislabeled or
+    oversized files, so that only ever produced a vague error after a
+    wasted request. Failing early lets us tell the person exactly what to do.
     """
     try:
         image = Image.open(io.BytesIO(image_bytes))
@@ -129,12 +150,11 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=85)
         return output.getvalue(), "image/jpeg"
-    except Exception as exc:  # noqa: BLE001 — any decode issue, just use the original
-        # Same idea as above: log the real reason shrinking failed, so a
-        # pattern (e.g. one phone/format consistently failing) is visible
-        # in Render's logs instead of silently falling back every time.
-        app.logger.warning("Could not shrink image, using original: %s", exc)
-        return image_bytes, "image/jpeg"
+    except Exception as exc:  # noqa: BLE001 — any decode issue
+        # Log the real reason, so a pattern (e.g. one phone/format
+        # consistently failing) is visible in Render's logs.
+        app.logger.warning("Could not open uploaded image: %s", exc)
+        raise UnreadableImageError(str(exc)) from exc
 
 # Your API key. Get one at https://console.anthropic.com — never put the
 # actual key in this file when you share/deploy it. Set it as an
@@ -259,7 +279,7 @@ UPLOAD_FORM = """
   <p class="notice">This is an early test, not a finished product — thanks for trying it. First load (or after a few idle minutes) can take 10-30 seconds to wake up; that's normal.</p>
   <p class="promise">Your photo is read once, transcribed, and never saved on our end.
   Our API provider briefly processes it to read the handwriting, never uses it
-  to train any model or shares it — and automatically deletes their own copy
+  to train any model or shares it — and normally deletes their own copy
   within 30 days.</p>
   <div class="tips">
     <p class="tips-title">For the best result</p>
@@ -696,7 +716,18 @@ def transcribe():
     # Read the image straight into memory. We never call uploaded_file.save(),
     # so it never touches the disk at all.
     original_bytes = uploaded_file.read()
-    image_bytes, media_type = shrink_image_if_needed(original_bytes)
+    try:
+        image_bytes, media_type = shrink_image_if_needed(original_bytes)
+    except UnreadableImageError:
+        return render_template_string(
+            ERROR_PAGE,
+            error=(
+                "We couldn't open that photo — the file may be damaged or in an "
+                "unusual format. Please try again with a JPG or PNG (taking a "
+                "screenshot of the photo and uploading that usually works too)."
+            ),
+            contact_email=CONTACT_EMAIL,
+        )
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
