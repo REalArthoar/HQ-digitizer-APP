@@ -459,12 +459,35 @@ RESULT_PAGE = """
 ERROR_PAGE = """
 <!doctype html>
 <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-  <h1>Something went wrong</h1>
+  <h1>{{ title or "Something went wrong" }}</h1>
+  {% if title %}
+  <p>{{ error }} <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20out%20of%20budget" style="color: #3a7bd5; font-weight: bold;">{{ contact_email }}</a></p>
+  <a href="/">Go back</a>
+  {% else %}
   <p>{{ error }}</p>
   <a href="/">Go back</a>
   <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">{{ contact_email }}</a></p>
+  {% endif %}
 </body></html>
 """
+
+
+BUDGET_ERROR_KEYWORDS = ("credit", "balance", "billing", "usage limit", "spend limit")
+
+
+def is_budget_error(exc: Exception) -> bool:
+    """True when the API refused because the money ran out.
+
+    Covers both cases: prepaid credits hitting zero ("credit balance is too
+    low") and a monthly spending cap set in the Anthropic Console being
+    reached (worded as a usage/spend limit instead).
+    """
+    text = str(exc).lower()
+    return any(keyword in text for keyword in BUDGET_ERROR_KEYWORDS)
+
+
+BUDGET_ERROR_TITLE = "Out of budget"
+BUDGET_ERROR_MESSAGE = "Please contact the admin to top it up:"
 
 
 def friendly_error_message(exc: Exception) -> str:
@@ -475,11 +498,8 @@ def friendly_error_message(exc: Exception) -> str:
     budget cap was reached."
     """
     text = str(exc).lower()
-    if "credit" in text or "balance" in text:
-        return (
-            "This early test has hit its monthly usage budget. "
-            "Please check back later, or let the person who shared this link know!"
-        )
+    if is_budget_error(exc):
+        return BUDGET_ERROR_MESSAGE
     if "rate limit" in text or "429" in text:
         return "This tool is getting a lot of use right now — please wait a minute and try again."
     if "overloaded" in text or "529" in text:
@@ -765,7 +785,10 @@ def transcribe():
         # never to the visitor's screen.
         app.logger.exception("Transcription failed: %s", exc)
         return render_template_string(
-            ERROR_PAGE, error=friendly_error_message(exc), contact_email=CONTACT_EMAIL
+            ERROR_PAGE,
+            title=BUDGET_ERROR_TITLE if is_budget_error(exc) else None,
+            error=friendly_error_message(exc),
+            contact_email=CONTACT_EMAIL,
         )
 
     # Rendered once, straight back into this response — never written to a
