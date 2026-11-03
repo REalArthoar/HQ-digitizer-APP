@@ -585,6 +585,9 @@ ERROR_PAGE = """
   <h1>{{ title or "Something went wrong" }}</h1>
   {% if title %}
   <p>{{ error }} <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20out%20of%20budget" style="color: #3a7bd5; font-weight: bold;">{{ contact_email }}</a></p>
+  {% if kofi_url %}
+  <p style="background: #f7f2ea; border-radius: 8px; padding: 10px 14px;">Want it back sooner? Any donation, even a tiny one, gets it topped up faster, and I'll add more than you gave: <a href="{{ kofi_url }}" target="_blank" rel="noopener" style="font-weight: bold;">{{ kofi_url }}</a></p>
+  {% endif %}
   <a href="/">Go back</a>
   {% else %}
   <p>{{ error }}</p>
@@ -934,6 +937,7 @@ def transcribe():
             title=BUDGET_ERROR_TITLE if is_budget_error(exc) else None,
             error=friendly_error_message(exc),
             contact_email=CONTACT_EMAIL,
+            kofi_url=KOFI_URL,
         )
 
     # Rendered once, straight back into this response — never written to a
