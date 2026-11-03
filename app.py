@@ -26,6 +26,12 @@ v3 changes (October 2026 check-up):
   PNG" message instead of a vague error after a wasted API call.
 - Package versions pinned in requirements.txt so a surprise upstream
   release can't break a redeploy.
+
+v4 changes (November 2026):
+- Uploads no longer get lost when Render's free server is asleep: the page
+  checks /health first, shows a "waking up" message, and sends the photo
+  once the server is ready. Reloading /transcribe goes back to the start.
+- Warm "paper" background with the content on a card, plus mobile sizing.
 """
 
 import base64
@@ -34,7 +40,7 @@ import os
 import re
 import time
 
-from flask import Flask, render_template_string, request
+from flask import Flask, redirect, render_template_string, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from markupsafe import Markup, escape
@@ -239,18 +245,112 @@ def call_model_with_retries(model: str, media_type: str, image_b64: str, prompt:
     raise last_overload_error
 
 
+# Shared look for every page: a soft warm "paper" background with the
+# content sitting on a white card, instead of plain white everywhere.
+PAGE_STYLE = """
+    html {
+      min-height: 100%;
+      background-color: #efe7da;
+      background-image:
+        radial-gradient(rgba(120, 90, 50, 0.07) 1px, transparent 1px),
+        linear-gradient(180deg, #f6f1e8 0%, #ebe1d1 100%);
+      background-size: 18px 18px, 100% 100%;
+    }
+    body {
+      margin: 0; padding: 40px 16px; box-sizing: border-box;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color: #2b2724;
+    }
+    .card {
+      background: #fffdf9; margin: 0 auto; padding: 28px 30px;
+      border-radius: 16px; border: 1px solid #e6dccb;
+      box-shadow: 0 10px 30px rgba(70, 50, 25, 0.10), 0 1px 3px rgba(70, 50, 25, 0.06);
+    }
+    @media (max-width: 560px) { body { padding: 16px 10px; } .card { padding: 20px 16px; } }
+    .wake-status { font-size: 0.85em; color: #8a5a00; background: #fff6e0; border-radius: 8px; padding: 8px 12px; margin-top: 10px; display: none; }
+"""
+
+# Render's free plan puts the app to sleep after ~15 idle minutes. If an old
+# tab is still open and someone uploads a photo while it's asleep, Render
+# answers with its own "waking up" screen and the upload is lost. So before
+# sending a photo, the page first checks /health. If the server isn't awake
+# yet, it shows a friendly "waking up" message on OUR page, keeps checking,
+# and only sends the photo once the server is really ready.
+WAKE_SCRIPT = """
+    async function serverIsAwake() {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const r = await fetch('/health?t=' + Date.now(), { cache: 'no-store', signal: controller.signal });
+        if (!r.ok) return false;
+        const data = await r.json();  // Render's wake-up page isn't JSON, so this fails until we're really up
+        return data && data.ok === true;
+      } catch (e) {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function waitForServer(statusEl, maxSeconds) {
+      if (await serverIsAwake()) return true;
+      statusEl.style.display = 'block';
+      statusEl.textContent = 'Waking up the server (it naps when nobody is using it)... this can take up to a minute. Your photo will be sent automatically, no need to reload.';
+      const start = Date.now();
+      while (Date.now() - start < maxSeconds * 1000) {
+        await new Promise(res => setTimeout(res, 3000));
+        if (await serverIsAwake()) { statusEl.style.display = 'none'; return true; }
+      }
+      statusEl.textContent = "The server is taking unusually long to wake up. Please wait a moment and press the button again.";
+      return false;
+    }
+
+    // Hand a form over to the "wait until awake, then send" flow.
+    function protectForm(form, button, busyText, statusEl, beforeSend) {
+      const idleText = button.textContent;
+      let sending = false;
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (sending) return;
+        if (beforeSend && !beforeSend()) return;
+        sending = true;
+        // Stop double/triple-clicking from firing multiple paid API calls.
+        button.disabled = true;
+        button.textContent = 'Checking the server...';
+        if (await waitForServer(statusEl, 120)) {
+          button.textContent = busyText;
+          form.submit();  // the real upload, now that the server is ready
+        } else {
+          sending = false;
+          button.disabled = false;
+          button.textContent = idleText;
+        }
+      });
+      // If the person comes back with the browser's Back button, reset it.
+      window.addEventListener('pageshow', () => {
+        sending = false; button.disabled = false; button.textContent = idleText;
+      });
+    }
+
+    // Start waking the server as soon as the page opens, so it's usually
+    // ready by the time someone has picked their photo.
+    serverIsAwake();
+"""
+
 UPLOAD_FORM = """
 <!doctype html>
 <html>
 <head>
   <title>Handwriting to Text — Private & Auto-Deleted</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: sans-serif; max-width: 480px; margin: 80px auto; text-align: center; }
+    __PAGE_STYLE__
+    .card { max-width: 520px; text-align: center; }
     h1 { font-size: 1.4em; }
     .promise { color: #2a6f2a; font-size: 0.95em; margin-bottom: 30px; }
     input[type=file] { margin: 20px 0; }
     button { padding: 10px 24px; font-size: 1em; cursor: pointer; }
-    .tips { text-align: left; background: #f4f4f4; border-radius: 8px; padding: 14px 18px; margin: 20px 0; font-size: 0.9em; color: #333; }
+    .tips { text-align: left; background: #f7f2ea; border-radius: 8px; padding: 14px 18px; margin: 20px 0; font-size: 0.9em; color: #333; }
     .tips p.tips-title { font-weight: bold; margin: 0 0 8px; text-align: center; }
     .tips ul { margin: 0; padding-left: 20px; }
     .tips li { margin-bottom: 6px; }
@@ -275,6 +375,7 @@ UPLOAD_FORM = """
   </style>
 </head>
 <body>
+<div class="card">
   <h1>Turn your handwriting into clean text</h1>
   <p class="notice">This is an early test, not a finished product — thanks for trying it. First load (or after a few idle minutes) can take 10-30 seconds to wake up; that's normal.</p>
   <p class="promise">Your photo is read once, transcribed, and never saved on our end.
@@ -304,8 +405,10 @@ UPLOAD_FORM = """
     <br>
     <input type="text" name="context" placeholder="Optional: language, topic, or hint (e.g. 'Lithuanian names and shift times')" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
     <button type="submit" id="submitBtn">Transcribe it</button>
+    <div class="wake-status" id="wakeStatus"></div>
   </form>
   <script>
+    __WAKE_SCRIPT__
     const dropzone = document.getElementById('dropzone');
     const photoInput = document.getElementById('photoInput');
     const cameraInput = document.getElementById('cameraInput');
@@ -357,21 +460,23 @@ UPLOAD_FORM = """
       }
     });
 
-    const submitBtn = document.getElementById('submitBtn');
-    uploadForm.addEventListener('submit', (e) => {
-      if (!photoInput.files.length) {
-        e.preventDefault();
-        alert('Please choose or drop a photo first.');
-        return;
+    protectForm(
+      uploadForm,
+      document.getElementById('submitBtn'),
+      'Reading your handwriting... (can take up to 30s)',
+      document.getElementById('wakeStatus'),
+      () => {
+        if (!photoInput.files.length) {
+          alert('Please choose or drop a photo first.');
+          return false;
+        }
+        return true;
       }
-      // Stop double/triple-clicking from firing multiple paid API calls
-      // while people wait for the (sometimes slow) first response.
-      submitBtn.disabled = true;
-      submitBtn.textContent = 'Reading your handwriting... (can take up to 30s)';
-    });
+    );
   </script>
   <p class="contact-footer">Found a bug, or have an idea? Email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20feedback">{{ contact_email }}</a><br>
   Free tool, running on my own budget — if you want to help out: <a href="{{ kofi_url }}" target="_blank" rel="noopener">{{ kofi_url }}</a></p>
+</div>
 </body>
 </html>
 """
@@ -380,23 +485,26 @@ RESULT_PAGE = """
 <!doctype html>
 <html>
 <head><title>Your Transcription</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: sans-serif; max-width: 1000px; margin: 40px auto; }
+    __PAGE_STYLE__
+    .card { max-width: 1040px; }
     .columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
-    .columns img { max-width: 460px; max-height: 80vh; border-radius: 8px; border: 1px solid #ddd; }
-    .result-content { background: #f4f4f4; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
+    .columns img { max-width: min(460px, 100%); max-height: 80vh; border-radius: 8px; border: 1px solid #ddd; }
+    .result-content { background: #f7f2ea; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
     .promise { color: #2a6f2a; font-size: 0.9em; }
     .legend { font-size: 0.8em; color: #666; margin-top: 6px; }
     .legend span { color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px; }
     .edit-box { margin-top: 24px; }
     .edit-box textarea { width: 100%; min-height: 160px; font-family: monospace; font-size: 0.95em; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
     .edit-box button { margin-top: 8px; padding: 6px 14px; cursor: pointer; }
-    .fix-word-box { margin-top: 30px; padding: 14px 18px; background: #f9f9f9; border-radius: 8px; border: 1px solid #eee; }
+    .fix-word-box { margin-top: 30px; padding: 14px 18px; background: #faf6ef; border-radius: 8px; border: 1px solid #ece3d4; }
     .fix-word-box h3 { margin: 0 0 8px; font-size: 1em; }
     .fix-word-box input[type=text] { width: 90%; padding: 6px; margin: 6px 0; }
   </style>
 </head>
 <body>
+<div class="card">
   <h1>Here's your text</h1>
   <p>Compare side by side to check the AI matched the right words to the right part of the page:</p>
   <div class="columns">
@@ -426,6 +534,7 @@ RESULT_PAGE = """
       <input type="text" name="previous_guess" placeholder="What did we get wrong? (e.g. 'Datos keistos')" required>
       <input type="text" name="context" placeholder="Optional: what it should probably say, or language hint">
       <button type="submit" id="fixWordBtn">Re-read this part</button>
+      <div class="wake-status" id="wakeStatus"></div>
     </form>
   </div>
 
@@ -435,6 +544,7 @@ RESULT_PAGE = """
   <p style="margin-top: 20px; font-size: 0.85em; color: #999;">This is a free early test, running on my own budget for API and hosting costs. Never required, just appreciated: <a href="{{ kofi_url }}" target="_blank" rel="noopener" style="color: #3a7bd5;">{{ kofi_url }}</a></p>
   <p style="font-size: 0.85em; color: #999;">Was this transcription wrong or weird somewhere? Email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20transcription%20issue" style="color: #3a7bd5;">{{ contact_email }}</a></p>
   <script>
+    __WAKE_SCRIPT__
     document.getElementById('copyBtn').addEventListener('click', () => {
       const textarea = document.getElementById('editableText');
       navigator.clipboard.writeText(textarea.value).then(() => {
@@ -444,21 +554,34 @@ RESULT_PAGE = """
       });
     });
 
-    // Same double-submit protection as the main upload form.
-    const fixWordForm = document.getElementById('fixWordForm');
-    const fixWordBtn = document.getElementById('fixWordBtn');
-    fixWordForm.addEventListener('submit', () => {
-      fixWordBtn.disabled = true;
-      fixWordBtn.textContent = 'Re-reading... (can take up to 30s)';
-    });
+    // Same wake-up check and double-submit protection as the main form —
+    // someone could sit on this page long enough for the server to nap.
+    protectForm(
+      document.getElementById('fixWordForm'),
+      document.getElementById('fixWordBtn'),
+      'Re-reading... (can take up to 30s)',
+      document.getElementById('wakeStatus')
+    );
   </script>
+</div>
 </body>
 </html>
 """
 
 ERROR_PAGE = """
 <!doctype html>
-<html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
+<html>
+<head>
+  <title>{{ title or "Something went wrong" }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    __PAGE_STYLE__
+    .card { max-width: 520px; }
+    a { color: #3a7bd5; }
+  </style>
+</head>
+<body>
+<div class="card">
   <h1>{{ title or "Something went wrong" }}</h1>
   {% if title %}
   <p>{{ error }} <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20out%20of%20budget" style="color: #3a7bd5; font-weight: bold;">{{ contact_email }}</a></p>
@@ -468,8 +591,15 @@ ERROR_PAGE = """
   <a href="/">Go back</a>
   <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">{{ contact_email }}</a></p>
   {% endif %}
+</div>
 </body></html>
 """
+
+# Drop the shared style and wake-up script into each page.
+UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE = (
+    page.replace("__PAGE_STYLE__", PAGE_STYLE).replace("__WAKE_SCRIPT__", WAKE_SCRIPT)
+    for page in (UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE)
+)
 
 
 BUDGET_ERROR_KEYWORDS = ("credit", "balance", "billing", "usage limit", "spend limit")
@@ -714,6 +844,21 @@ def index():
     return render_template_string(
         UPLOAD_FORM, contact_email=CONTACT_EMAIL, kofi_url=KOFI_URL
     )
+
+
+@app.route("/health")
+def health():
+    """Tiny "are you awake?" check used by the pages before uploading.
+    Never calls the AI, so it costs nothing."""
+    return {"ok": True}
+
+
+@app.route("/transcribe", methods=["GET"])
+def transcribe_reload():
+    """Someone reloaded the result/loading page, or landed here after
+    Render's wake-up screen. There's no photo to read, so just send them
+    back to the start instead of showing a "Method Not Allowed" error."""
+    return redirect("/")
 
 
 @app.route("/transcribe", methods=["POST"])
