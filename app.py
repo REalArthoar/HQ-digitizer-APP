@@ -110,7 +110,7 @@ class UnreadableImageError(Exception):
     """The uploaded file couldn't be opened as an image at all."""
 
 
-def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
+def shrink_image_if_needed(image_bytes: bytes, rotate_clockwise: int = 0) -> tuple[bytes, str]:
     """Resize large photos down to a sensible size and re-encode as JPEG.
 
     Modern phone photos are often 10-20+ MB, way more detail than needed to
@@ -145,6 +145,11 @@ def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
         # the correct rotation into the actual pixels now, or it'll come out
         # sideways everywhere from here on.
         image = ImageOps.exif_transpose(image)
+        # The person can turn a sideways photo upright on the upload page.
+        # Doing it here (not in the browser) means it works for every
+        # format. PIL's rotate() turns counter-clockwise, hence the minus.
+        if rotate_clockwise in (90, 180, 270):
+            image = image.rotate(-rotate_clockwise, expand=True)
         image = image.convert("RGB")
         width, height = image.size
         longest_edge = max(width, height)
@@ -200,6 +205,7 @@ Rules:
 - If the handwriting contains a table, grid, or calendar-like structure with clear rows and columns, represent it as a markdown table: a header row and each data row wrapped in | pipes |, with a |---|---| separator row directly under the header. Keep the number of columns consistent with what's actually in the photo.
 - Transcribe EVERY handwritten mark on the page, not just words: every symbol of ANY kind, with no exceptions. The examples here are only examples, not a complete list — punctuation (. , : ; ! ? ' " ( ) [ ] / \\ | _ ~), math and comparison signs (+ − = × ÷ < > ≤ ≥ ≈ % ^), currency and special characters ($ € £ & @ # *), dashes and lines, tick marks and checkmarks (✓), crosses (✗ x), arrows (→ ← ↑ ↓ ↔ ⇒), letters used as marks (V, X, O), bullets and dots (• ·), boxes and circles (☐ ☑ ○ ●), stars (★ ☆), hearts (♥), numbers, circled or underlined markers, and anything else the writer drew. Include them even when they stand alone on an otherwise empty line, sit in a margin, or form a column next to the text. These marks often carry meaning for the writer (a tracker, a rating, a status), so never skip any of them as decoration.
 - Write each symbol with the character (keyboard or Unicode) that best matches its shape as drawn — e.g. a hand-drawn arrow becomes →, not "->" or nothing. Only use ✓ or ✗ when it is clearly a checkmark or a cross. Keep each mark on the same line, in the same position, as it appears on the page.
+- Read EVERY symbol RELATIVE TO THE PAGE, not the photo. If the photo is sideways or upside down, first work out which way is up for the writing (the direction the words read), then turn EACH AND EVERY symbol the same way in your head before naming it — not just a few common ones. This applies to all marks without exception: dashes, lines, arrows, angle brackets, checkmarks, letters and numbers used as marks, brackets, math signs, and any other shape whose meaning changes when turned. Use the direction of the handwriting as your reference: a stroke parallel to the text lines is "-", one perpendicular to them is "|". Examples for a photo turned 90°: what looks like | is really -, what looks like ‖ is really =, ^ and v may really be < or > (and < or > may really be V or ^), ↑ and ↓ may really be → or ←, and a sideways checkmark is still ✓. Symbols that look the same at any angle (+ x o * •) stay as they are. For an upside-down photo, flip each symbol the same way (e.g. ^ becomes v, → becomes ←). Go line by line down the page: write all the marks that sit on one ruled line together on that one output line (e.g. "-   V"), never collect all similar-looking marks from different lines into a single row.
 - If a mark has no matching character (a small doodle or drawing), describe it briefly in square brackets, like [drawing: smiley face]. If you can see there is a mark but can't tell which symbol it is, write [mark?].
 - Scan the WHOLE page, edge to edge, including margins, corners, and lines below the main text, before you finish.
 - The photo may be rotated or taken at an angle. Read the writing in its natural direction, and keep the lines in the order the writer wrote them.
@@ -371,6 +377,11 @@ UPLOAD_FORM = """
     }
     .dropzone.dragover { background: #eef6ff; border-color: #3a7bd5; color: #3a7bd5; }
     .dropzone .filename { font-weight: bold; margin-top: 8px; color: #2a6f2a; }
+    .rotate-box { display: none; margin: 14px 0 4px; padding: 12px; background: #f7f2ea; border-radius: 10px; }
+    .rotate-hint { font-size: 0.85em; color: #6b5d4d; margin: 0 0 8px; }
+    .preview-frame { width: 220px; height: 220px; margin: 0 auto 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    .preview-frame img { max-width: 200px; max-height: 200px; transition: transform 0.2s; border-radius: 4px; }
+    .rotate-box button { padding: 6px 12px; margin: 0 4px; cursor: pointer; }
     .camera-btn {
       display: inline-block; margin-top: 8px; font-size: 0.85em;
       color: #3a7bd5; text-decoration: underline; cursor: pointer; background: none; border: none;
@@ -407,6 +418,14 @@ UPLOAD_FORM = """
     <input type="file" name="photo" id="photoInput" accept="image/*" required style="display:none;">
     <button type="button" class="camera-btn" id="cameraBtn">Or take a photo now</button>
     <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
+    <div class="rotate-box" id="rotateBox">
+      <p class="rotate-hint">Is the writing upright? If not, turn it until it reads normally — every symbol and mark is read the way it faces, so this matters.</p>
+      <div class="preview-frame"><img id="previewImg" alt="Preview of your photo"></div>
+      <p class="rotate-hint" id="noPreview" style="display:none;">(No preview for this file type in your browser — rotating still works.)</p>
+      <button type="button" id="rotateLeft">↺ Rotate left</button>
+      <button type="button" id="rotateRight">Rotate right ↻</button>
+    </div>
+    <input type="hidden" name="rotate" id="rotateInput" value="0">
     <br>
     <input type="text" name="context" placeholder="Optional: language, topic, or hint (e.g. 'Lithuanian names and shift times')" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
     <button type="submit" id="submitBtn">Transcribe it</button>
@@ -422,9 +441,35 @@ UPLOAD_FORM = """
     const dropzoneText = document.getElementById('dropzoneText');
     const uploadForm = document.getElementById('uploadForm');
 
+    // Rotation: the preview just turns on screen; the real turning happens
+    // on the server, so it works for every format (even iPhone HEIC).
+    const rotateBox = document.getElementById('rotateBox');
+    const previewImg = document.getElementById('previewImg');
+    const noPreview = document.getElementById('noPreview');
+    const rotateInput = document.getElementById('rotateInput');
+    let rotation = 0;
+    let previewUrl = null;
+
+    function setRotation(deg) {
+      rotation = ((deg % 360) + 360) % 360;
+      rotateInput.value = rotation;
+      previewImg.style.transform = 'rotate(' + rotation + 'deg)';
+    }
+    document.getElementById('rotateLeft').addEventListener('click', () => setRotation(rotation - 90));
+    document.getElementById('rotateRight').addEventListener('click', () => setRotation(rotation + 90));
+
     function showChosenFile(file) {
       filenameLabel.textContent = file ? file.name : '';
       dropzoneText.textContent = file ? 'Photo selected — click to change' : 'Drag & drop a photo here, or click to browse';
+      setRotation(0);
+      if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+      if (!file) { rotateBox.style.display = 'none'; return; }
+      previewUrl = URL.createObjectURL(file);
+      previewImg.style.display = '';
+      noPreview.style.display = 'none';
+      previewImg.onerror = () => { previewImg.style.display = 'none'; noPreview.style.display = 'block'; };
+      previewImg.src = previewUrl;
+      rotateBox.style.display = 'block';
     }
 
     // Click the dropzone to open the normal file picker.
@@ -895,7 +940,11 @@ def transcribe():
     # so it never touches the disk at all.
     original_bytes = uploaded_file.read()
     try:
-        image_bytes, media_type = shrink_image_if_needed(original_bytes)
+        try:
+            rotate_clockwise = int(request.form.get("rotate", "0"))
+        except ValueError:
+            rotate_clockwise = 0
+        image_bytes, media_type = shrink_image_if_needed(original_bytes, rotate_clockwise)
     except UnreadableImageError:
         return render_template_string(
             ERROR_PAGE,
