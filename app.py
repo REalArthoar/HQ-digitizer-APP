@@ -198,6 +198,11 @@ Rules:
 - If you are unsure about a specific word but have a reasonable guess, write it followed by a question mark in brackets, like this: word[?]
 - If any text is crossed out or struck through in the photo, wrap just that word or phrase in double tildes, like this: ~~word~~. Crossed-out text is often written faster and messier than the rest — take the same care reading it as anything else, and use word[?] instead of guessing if you're not genuinely confident.
 - If the handwriting contains a table, grid, or calendar-like structure with clear rows and columns, represent it as a markdown table: a header row and each data row wrapped in | pipes |, with a |---|---| separator row directly under the header. Keep the number of columns consistent with what's actually in the photo.
+- Transcribe EVERY handwritten mark on the page, not just words: every symbol of ANY kind, with no exceptions. The examples here are only examples, not a complete list — punctuation (. , : ; ! ? ' " ( ) [ ] / \\ | _ ~), math and comparison signs (+ − = × ÷ < > ≤ ≥ ≈ % ^), currency and special characters ($ € £ & @ # *), dashes and lines, tick marks and checkmarks (✓), crosses (✗ x), arrows (→ ← ↑ ↓ ↔ ⇒), letters used as marks (V, X, O), bullets and dots (• ·), boxes and circles (☐ ☑ ○ ●), stars (★ ☆), hearts (♥), numbers, circled or underlined markers, and anything else the writer drew. Include them even when they stand alone on an otherwise empty line, sit in a margin, or form a column next to the text. These marks often carry meaning for the writer (a tracker, a rating, a status), so never skip any of them as decoration.
+- Write each symbol with the character (keyboard or Unicode) that best matches its shape as drawn — e.g. a hand-drawn arrow becomes →, not "->" or nothing. Only use ✓ or ✗ when it is clearly a checkmark or a cross. Keep each mark on the same line, in the same position, as it appears on the page.
+- If a mark has no matching character (a small doodle or drawing), describe it briefly in square brackets, like [drawing: smiley face]. If you can see there is a mark but can't tell which symbol it is, write [mark?].
+- Scan the WHOLE page, edge to edge, including margins, corners, and lines below the main text, before you finish.
+- The photo may be rotated or taken at an angle. Read the writing in its natural direction, and keep the lines in the order the writer wrote them.
 - Preserve the layout as closely as possible (line breaks, bullet points, indentation).
 - Return ONLY the transcription. No commentary, no "Here is the transcription:", nothing else.
 """
@@ -663,6 +668,11 @@ def _inline_format(segment: str) -> str:
     escaped = re.sub(
         r"\[illegible\]",
         f'<span style="{UNCERTAIN_STYLE}" title="The AI could not read this — check the photo">[illegible]</span>',
+        escaped,
+    )
+    escaped = re.sub(
+        r"\[mark\?\]",
+        f'<span style="{UNCERTAIN_STYLE}" title="There is a symbol or mark here the AI could not identify — check the photo">[mark?]</span>',
         escaped,
     )
     escaped = re.sub(
