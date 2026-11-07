@@ -39,6 +39,7 @@ import io
 import os
 import re
 import time
+from urllib.parse import quote
 
 from flask import Flask, redirect, render_template_string, request
 from flask_limiter import Limiter
@@ -556,16 +557,16 @@ RESULT_PAGE = """
 <body>
 <div class="card">
   <h1>Here's your text</h1>
-  <p>Compare side by side to check the AI matched the right words to the right part of the page:</p>
+  <p>Compare side by side to check the right words were matched to the right part to the right part of the page:</p>
   <div class="columns">
     <img src="data:{{ media_type }};base64,{{ image_b64 }}" alt="Your uploaded photo">
     <div class="result-content">{{ text }}</div>
   </div>
-  <p class="legend"><span>Highlighted text</span> means the AI wasn't fully confident — worth double-checking against the photo.</p>
+  <p class="legend"><span>Highlighted text</span> means the tool wasn't fully sure — worth double-checking against the photo.</p>
   {% if used_fallback_model %}
   <p style="font-size:0.85em; color:#a06a00; background:#fff8e6; padding:8px 12px; border-radius:6px; margin-top:10px;">
-    Our usual AI was briefly overloaded with demand, so this one read was done with a backup model instead.
-    It may be very slightly less precise than usual — worth a quick double-check, and feel free to re-try in a bit for our best model.
+    Text recognition was briefly overloaded with demand, so the tool read this one in backup mode instead.
+    It may be very slightly less precise than usual — worth a quick double-check, and feel free to try again in a bit for full precision.
   </p>
   {% endif %}
 
@@ -628,21 +629,31 @@ ERROR_PAGE = """
     __PAGE_STYLE__
     .card { max-width: 520px; }
     a { color: #3a7bd5; }
+    .whose { display: inline-block; font-size: 0.85em; font-weight: 600; border-radius: 999px; padding: 4px 12px; margin: 0 0 4px; }
+    .whose-server { background: #e8f1fb; color: #2b5d9a; }
+    .whose-photo  { background: #fff3dc; color: #8a5a00; }
+    .whose-wait   { background: #eef6ea; color: #2a6f2a; }
+    .todo { background: #f7f2ea; border-radius: 8px; padding: 10px 14px; }
+    .err-footer { margin-top: 28px; font-size: 0.85em; color: #8a8178; }
+    .err-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.95em; color: #6b5d4d; }
   </style>
 </head>
 <body>
 <div class="card">
   <h1>{{ title or "Something went wrong" }}</h1>
-  {% if title %}
+  {% if budget %}
   <p>{{ error }} <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20out%20of%20budget" style="color: #3a7bd5; font-weight: bold;">{{ contact_email }}</a></p>
   {% if kofi_url %}
   <p style="background: #f7f2ea; border-radius: 8px; padding: 10px 14px;">Want it back sooner? Any donation, even a tiny one, gets it topped up faster, and I'll add more than you gave: <a href="{{ kofi_url }}" target="_blank" rel="noopener" style="font-weight: bold;">{{ kofi_url }}</a></p>
   {% endif %}
   <a href="/">Go back</a>
   {% else %}
+  {% if whose %}<p class="whose whose-{{ whose }}">{{ whose_text }}</p>{% endif %}
   <p>{{ error }}</p>
-  <a href="/">Go back</a>
-  <p style="margin-top: 30px; font-size: 0.85em; color: #999;">If this keeps happening, email: <a href="mailto:{{ contact_email }}?subject=Handwriting%20app%20-%20error" style="color: #3a7bd5;">{{ contact_email }}</a></p>
+  {% if todo %}<p class="todo"><strong>What you can do:</strong> {{ todo }}</p>{% endif %}
+  <a href="/">Go back and try again</a>
+  <p class="err-footer">Still stuck? Email <a href="mailto:{{ contact_email }}?subject={{ mail_subject }}">{{ contact_email }}</a>{% if code %} and mention the error code below{% endif %}.
+  {% if code %}<br><span class="err-code">Error code: {{ code }}</span>{% endif %}</p>
   {% endif %}
 </div>
 </body></html>
@@ -673,28 +684,116 @@ BUDGET_ERROR_TITLE = "Out of budget"
 BUDGET_ERROR_MESSAGE = "Please contact the admin to top it up:"
 
 
-def friendly_error_message(exc: Exception) -> str:
-    """Translate technical/API errors into something a stranger can understand.
+class EmptyTranscriptionError(Exception):
+    """The AI answered, but with no text in it."""
 
-    We never want a random tester to see a raw API error dump — it looks
-    broken even when it's actually something simple like "the monthly
-    budget cap was reached."
+
+# Small label at the top of each error page, so people instantly know
+# whether to fix their photo, just wait, or tell the admin.
+WHOSE_TEXT = {
+    "server": "Your photo is fine — this problem is on our side.",
+    "photo": "This is about the photo itself.",
+    "wait": "Nothing is broken — it just needs a short wait.",
+}
+
+# Every error the visitor can see: code -> (whose, heading, what happened, what to do).
+ERRORS = {
+    "OVERLOADED": ("wait", "Very busy right now",
+        "Text recognition is overloaded with demand from everyone using it at the moment. "
+        "The tool tried several times, and also tried backup mode, but both were busy.",
+        "Wait 30 seconds to a minute, then try again. Your photo wasn't saved, so you'll need to choose it again."),
+    "BUSY": ("wait", "Too many photos at once",
+        "Lots of people are using this tool at the same moment, and the tool has reached the text recognition limit "
+        "on how many photos it can read per minute.",
+        "Wait a minute, then try again."),
+    "TIMEOUT": ("server", "That took too long",
+        "Text recognition didn't answer in time. This sometimes happens with very large or very dense pages.",
+        "Try again. If it keeps happening, photograph the page in two halves instead of one."),
+    "CONNECTION": ("server", "Couldn't reach text recognition",
+        "The tool couldn't connect to text recognition. This is usually a brief network hiccup.",
+        "Try again in a minute."),
+    "SERVICE_DOWN": ("server", "Text recognition had a problem",
+        "Text recognition had a temporary error on its end.",
+        "Try again in a minute or two."),
+    "SETUP": ("server", "The tool needs fixing",
+        "The tool's connection to text recognition isn't set up correctly right now. "
+        "The admin has to fix this, so trying again won't help yet.",
+        "Please email the admin (below) with the error code, so it gets fixed quickly."),
+    "REQUEST": ("server", "The tool made a mistake",
+        "Text recognition rejected the way the tool asked it to read your photo. That's a bug on our side.",
+        "Try once more. If it happens again, please email the admin with the error code."),
+    "PHOTO_REJECTED": ("photo", "This photo couldn't be accepted",
+        "Text recognition refused this image. It may be too large, in an unusual format, or damaged.",
+        "Try a JPG or PNG photo, or take a screenshot of your photo and upload that instead."),
+    "NO_TEXT": ("photo", "No text came back",
+        "The tool read your photo but couldn't find any text. This can happen if there's no readable "
+        "writing in it, or the photo is very dark, blurry, or taken from far away.",
+        "Try a closer, sharper photo in good light, with the page filling most of the frame."),
+    "UNKNOWN": ("server", "Something unexpected went wrong",
+        "We hit an error we didn't expect. It's most likely on our side, not a problem with your photo.",
+        "Try once more. If it happens again, please email the admin with the error code so it can be fixed."),
+    "NO_PHOTO": ("photo", "No photo was uploaded",
+        "We didn't receive a photo with your request.",
+        "Go back, choose or take a photo, then press \"Transcribe it\"."),
+    "NOT_IMAGE": ("photo", "That's not an image file",
+        "The file you chose doesn't look like a photo or picture.",
+        "Choose a photo instead, such as a JPG, PNG, or iPhone HEIC."),
+    "UNREADABLE": ("photo", "We couldn't open that photo",
+        "The file may be damaged or in a format we can't read.",
+        "Try again with a JPG or PNG. Taking a screenshot of the photo and uploading that usually works too."),
+    "TOO_LARGE": ("photo", "That file is too large",
+        "Photos can be up to 25 MB, and this one is bigger.",
+        "Choose a smaller photo, or take a screenshot of it and upload that."),
+    "LIMIT": ("wait", "Please slow down a little",
+        "You've sent a lot of photos in a short time, so this free tool is pausing you briefly "
+        "to keep it available for everyone. The limit is 5 photos per minute and 30 per day.",
+        "Wait a minute and try again. If you've reached the daily limit, try again tomorrow."),
+}
+
+
+def classify_error(exc: Exception) -> str:
+    """Pick which ERRORS entry fits a failed AI request."""
+    if isinstance(exc, anthropic.OverloadedError):
+        return "OVERLOADED"
+    if isinstance(exc, anthropic.RateLimitError):
+        return "BUSY"
+    if isinstance(exc, anthropic.APITimeoutError):  # must come before APIConnectionError
+        return "TIMEOUT"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "CONNECTION"
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError)):
+        return "SETUP"
+    if isinstance(exc, anthropic.RequestTooLargeError):
+        return "PHOTO_REJECTED"
+    if isinstance(exc, anthropic.BadRequestError):
+        return "PHOTO_REJECTED" if "image" in str(exc).lower() else "REQUEST"
+    if isinstance(exc, anthropic.InternalServerError):
+        return "SERVICE_DOWN"
+    if isinstance(exc, EmptyTranscriptionError):
+        return "NO_TEXT"
+    return "UNKNOWN"
+
+
+def error_page(code: str, status: int = 200):
+    """Render the error page for one of the ERRORS codes.
+
+    The error code shown on the page includes the time (UTC), so when
+    someone emails it in, you can find the exact matching entry in
+    Render's logs.
     """
-    text = str(exc).lower()
-    if is_budget_error(exc):
-        return BUDGET_ERROR_MESSAGE
-    if "rate limit" in text or "429" in text:
-        return "This tool is getting a lot of use right now — please wait a minute and try again."
-    if "overloaded" in text or "529" in text:
-        return (
-            "The AI service we use is briefly overloaded with demand from everyone "
-            "using it right now — this isn't about your photo. Please wait a few "
-            "seconds and try again."
-        )
-    return (
-        "Something went wrong reading that photo. Please try again, "
-        "or try a different photo if this keeps happening."
-    )
+    whose, title, what, todo = ERRORS[code]
+    stamped_code = f"{code} · {time.strftime('%Y-%m-%d %H:%M', time.gmtime())} UTC"
+    return render_template_string(
+        ERROR_PAGE,
+        title=title,
+        error=what,
+        todo=todo,
+        whose=whose,
+        whose_text=WHOSE_TEXT[whose],
+        code=stamped_code,
+        mail_subject=quote(f"Handwriting app error: {stamped_code}"),
+        contact_email=CONTACT_EMAIL,
+    ), status
 
 
 UNCERTAIN_STYLE = 'color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px;'
@@ -712,17 +811,17 @@ def _inline_format(segment: str) -> str:
     escaped = str(escape(segment))
     escaped = re.sub(
         r"\[illegible\]",
-        f'<span style="{UNCERTAIN_STYLE}" title="The AI could not read this — check the photo">[illegible]</span>',
+        f'<span style="{UNCERTAIN_STYLE}" title="This part could not be read — check the photo">[illegible]</span>',
         escaped,
     )
     escaped = re.sub(
         r"\[mark\?\]",
-        f'<span style="{UNCERTAIN_STYLE}" title="There is a symbol or mark here the AI could not identify — check the photo">[mark?]</span>',
+        f'<span style="{UNCERTAIN_STYLE}" title="There is a symbol or mark here that could not be identified — check the photo">[mark?]</span>',
         escaped,
     )
     escaped = re.sub(
         r"(\S+?\[\?\])",
-        rf'<span style="{UNCERTAIN_STYLE}" title="The AI was not fully sure about this — double check it">\1</span>',
+        rf'<span style="{UNCERTAIN_STYLE}" title="The tool was not fully sure about this — double check it">\1</span>',
         escaped,
     )
     return re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped)
@@ -877,24 +976,12 @@ def clean_text_for_copy(raw_text: str) -> str:
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return render_template_string(
-        ERROR_PAGE,
-        error="That file is too large (25 MB limit). Try a different photo.",
-        contact_email=CONTACT_EMAIL,
-    ), 413
+    return error_page("TOO_LARGE", 413)
 
 
 @app.errorhandler(429)
 def rate_limited(_error):
-    return render_template_string(
-        ERROR_PAGE,
-        error=(
-            "You've sent a lot of requests in a short time, so this early "
-            "test is pausing you briefly to keep it available for everyone. "
-            "Please wait a minute (or try again tomorrow) and try again."
-        ),
-        contact_email=CONTACT_EMAIL,
-    ), 429
+    return error_page("LIMIT", 429)
 
 
 @app.route("/")
@@ -924,17 +1011,11 @@ def transcribe_reload():
 def transcribe():
     uploaded_file = request.files.get("photo")
     if not uploaded_file or uploaded_file.filename == "":
-        return render_template_string(
-            ERROR_PAGE, error="No photo was uploaded.", contact_email=CONTACT_EMAIL
-        )
+        return error_page("NO_PHOTO")
 
     media_type = uploaded_file.mimetype or ""
     if not media_type.startswith("image/"):
-        return render_template_string(
-            ERROR_PAGE,
-            error=f"That doesn't look like an image file ({media_type or 'unknown type'}). Please upload a photo.",
-            contact_email=CONTACT_EMAIL,
-        )
+        return error_page("NOT_IMAGE")
 
     # Read the image straight into memory. We never call uploaded_file.save(),
     # so it never touches the disk at all.
@@ -946,15 +1027,7 @@ def transcribe():
             rotate_clockwise = 0
         image_bytes, media_type = shrink_image_if_needed(original_bytes, rotate_clockwise)
     except UnreadableImageError:
-        return render_template_string(
-            ERROR_PAGE,
-            error=(
-                "We couldn't open that photo — the file may be damaged or in an "
-                "unusual format. Please try again with a JPG or PNG (taking a "
-                "screenshot of the photo and uploading that usually works too)."
-            ),
-            contact_email=CONTACT_EMAIL,
-        )
+        return error_page("UNREADABLE")
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
@@ -984,20 +1057,25 @@ def transcribe():
             None,
         )
         if text is None:
-            raise ValueError("The model didn't return any readable text.")
+            raise EmptyTranscriptionError("The model didn't return any readable text.")
     except Exception as exc:  # noqa: BLE001 — never show a raw technical error to a stranger
         # The person sees a friendly message below, but we still need the
         # REAL error somewhere so we can actually debug it — this prints
         # the full technical error and traceback to Render's logs only,
         # never to the visitor's screen.
-        app.logger.exception("Transcription failed: %s", exc)
-        return render_template_string(
-            ERROR_PAGE,
-            title=BUDGET_ERROR_TITLE if is_budget_error(exc) else None,
-            error=friendly_error_message(exc),
-            contact_email=CONTACT_EMAIL,
-            kofi_url=KOFI_URL,
-        )
+        if is_budget_error(exc):
+            app.logger.exception("Transcription failed [BUDGET]: %s", exc)
+            return render_template_string(
+                ERROR_PAGE,
+                budget=True,
+                title=BUDGET_ERROR_TITLE,
+                error=BUDGET_ERROR_MESSAGE,
+                contact_email=CONTACT_EMAIL,
+                kofi_url=KOFI_URL,
+            )
+        code = classify_error(exc)
+        app.logger.exception("Transcription failed [%s]: %s", code, exc)
+        return error_page(code)
 
     # Rendered once, straight back into this response — never written to a
     # file, database, or log. It exists only in this one page load.
