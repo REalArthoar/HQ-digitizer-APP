@@ -45,7 +45,7 @@ from flask import Flask, redirect, render_template_string, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from markupsafe import Markup, escape
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pillow_heif import register_heif_opener
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -111,7 +111,7 @@ class UnreadableImageError(Exception):
     """The uploaded file couldn't be opened as an image at all."""
 
 
-def shrink_image_if_needed(image_bytes: bytes, rotate_clockwise: int = 0) -> tuple[bytes, str]:
+def shrink_image_if_needed(image_bytes: bytes) -> tuple[bytes, str]:
     """Resize large photos down to a sensible size and re-encode as JPEG.
 
     Modern phone photos are often 10-20+ MB, way more detail than needed to
@@ -146,11 +146,6 @@ def shrink_image_if_needed(image_bytes: bytes, rotate_clockwise: int = 0) -> tup
         # the correct rotation into the actual pixels now, or it'll come out
         # sideways everywhere from here on.
         image = ImageOps.exif_transpose(image)
-        # The person can turn a sideways photo upright on the upload page.
-        # Doing it here (not in the browser) means it works for every
-        # format. PIL's rotate() turns counter-clockwise, hence the minus.
-        if rotate_clockwise in (90, 180, 270):
-            image = image.rotate(-rotate_clockwise, expand=True)
         image = image.convert("RGB")
         width, height = image.size
         longest_edge = max(width, height)
@@ -167,6 +162,83 @@ def shrink_image_if_needed(image_bytes: bytes, rotate_clockwise: int = 0) -> tup
         # consistently failing) is visible in Render's logs.
         app.logger.warning("Could not open uploaded image: %s", exc)
         raise UnreadableImageError(str(exc)) from exc
+
+# Small, cheap model used only to work out which way is up. Picking the
+# upright picture out of four is an easy question, so the smallest model
+# is plenty — it costs a tiny fraction of a cent per photo.
+ORIENT_MODEL = "claude-haiku-5-5"
+ORIENT_TILE = 512  # pixels per picture in the A/B/C/D grid
+ORIENT_ANGLES = (0, 90, 180, 270)  # clockwise turn shown as A, B, C, D
+
+
+def _orientation_grid(image: Image.Image) -> bytes:
+    """One small picture with the photo shown four ways, labeled A-D."""
+    gap = 30
+    grid = Image.new("RGB", (ORIENT_TILE * 2 + gap, ORIENT_TILE * 2 + gap), "white")
+    draw = ImageDraw.Draw(grid)
+    font = ImageFont.load_default(size=44)
+    for i, (angle, label) in enumerate(zip(ORIENT_ANGLES, "ABCD")):
+        tile = image.rotate(-angle, expand=True)
+        tile.thumbnail((ORIENT_TILE, ORIENT_TILE))
+        x = (i % 2) * (ORIENT_TILE + gap)
+        y = (i // 2) * (ORIENT_TILE + gap)
+        grid.paste(tile, (x + (ORIENT_TILE - tile.width) // 2, y + (ORIENT_TILE - tile.height) // 2))
+        draw.rectangle([x, y, x + 56, y + 56], fill="black")
+        draw.text((x + 14, y + 2), label, fill="white", font=font)
+    out = io.BytesIO()
+    grid.save(out, format="JPEG", quality=80)
+    return out.getvalue()
+
+
+def auto_orient(image_bytes: bytes) -> bytes:
+    """Turn the photo so the handwriting is upright, without asking the visitor.
+
+    People photograph notebooks sideways or upside down all the time, and
+    reading symbols like - | < > V correctly depends on knowing which way is
+    up. Asking text recognition to "turn them in its head" proved unreliable,
+    so instead we fix the photo itself before it's read.
+
+    If anything goes wrong here (unclear answer, network error, budget), we
+    just carry on with the photo as it was — this step should never be the
+    reason a transcription fails.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        grid_b64 = base64.b64encode(_orientation_grid(image)).decode("utf-8")
+        message = client.messages.create(
+            model=ORIENT_MODEL,
+            max_tokens=1024,
+            timeout=30,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": grid_b64}},
+                    {"type": "text", "text": (
+                        "This picture shows the same photo of handwriting four times, each turned "
+                        "a different way, labeled A, B, C and D. In which one is the handwriting "
+                        "upright, so the words read normally from left to right and the lines go "
+                        "from top to bottom? If the page is a bit tilted, pick the one closest to "
+                        "upright. Answer with just the letter."
+                    )},
+                ],
+            }],
+        )
+        answer = next((b.text for b in message.content if b.type == "text"), "")
+        match = re.fullmatch(r"\W*([ABCD])\W*", answer.strip())
+        if not match:
+            app.logger.warning("Auto-orient: unclear answer %r, leaving photo as is", answer[:40])
+            return image_bytes
+        angle = ORIENT_ANGLES["ABCD".index(match.group(1))]
+        if angle == 0:
+            return image_bytes
+        app.logger.info("Auto-orient: turning photo %s degrees clockwise", angle)
+        out = io.BytesIO()
+        image.rotate(-angle, expand=True).save(out, format="JPEG", quality=85)
+        return out.getvalue()
+    except Exception as exc:  # noqa: BLE001 — never let this step break a transcription
+        app.logger.warning("Auto-orient skipped: %s", exc)
+        return image_bytes
+
 
 # Your API key. Get one at https://console.anthropic.com — never put the
 # actual key in this file when you share/deploy it. Set it as an
@@ -206,7 +278,10 @@ Rules:
 - If the handwriting contains a table, grid, or calendar-like structure with clear rows and columns, represent it as a markdown table: a header row and each data row wrapped in | pipes |, with a |---|---| separator row directly under the header. Keep the number of columns consistent with what's actually in the photo.
 - Transcribe EVERY handwritten mark on the page, not just words: every symbol of ANY kind, with no exceptions. The examples here are only examples, not a complete list — punctuation (. , : ; ! ? ' " ( ) [ ] / \\ | _ ~), math and comparison signs (+ − = × ÷ < > ≤ ≥ ≈ % ^), currency and special characters ($ € £ & @ # *), dashes and lines, tick marks and checkmarks (✓), crosses (✗ x), arrows (→ ← ↑ ↓ ↔ ⇒), letters used as marks (V, X, O), bullets and dots (• ·), boxes and circles (☐ ☑ ○ ●), stars (★ ☆), hearts (♥), numbers, circled or underlined markers, and anything else the writer drew. Include them even when they stand alone on an otherwise empty line, sit in a margin, or form a column next to the text. These marks often carry meaning for the writer (a tracker, a rating, a status), so never skip any of them as decoration.
 - Write each symbol with the character (keyboard or Unicode) that best matches its shape as drawn — e.g. a hand-drawn arrow becomes →, not "->" or nothing. Only use ✓ or ✗ when it is clearly a checkmark or a cross. Keep each mark on the same line, in the same position, as it appears on the page.
-- Read EVERY symbol RELATIVE TO THE PAGE, not the photo. If the photo is sideways or upside down, first work out which way is up for the writing (the direction the words read), then turn EACH AND EVERY symbol the same way in your head before naming it — not just a few common ones. This applies to all marks without exception: dashes, lines, arrows, angle brackets, checkmarks, letters and numbers used as marks, brackets, math signs, and any other shape whose meaning changes when turned. Use the direction of the handwriting as your reference: a stroke parallel to the text lines is "-", one perpendicular to them is "|". Examples for a photo turned 90°: what looks like | is really -, what looks like ‖ is really =, ^ and v may really be < or > (and < or > may really be V or ^), ↑ and ↓ may really be → or ←, and a sideways checkmark is still ✓. Symbols that look the same at any angle (+ x o * •) stay as they are. For an upside-down photo, flip each symbol the same way (e.g. ^ becomes v, → becomes ←). Go line by line down the page: write all the marks that sit on one ruled line together on that one output line (e.g. "-   V"), never collect all similar-looking marks from different lines into a single row.
+- The photo has already been turned so the writing is upright. Read every symbol exactly as it is drawn in this image — do NOT mentally rotate or flip any symbol. A mark that looks like - is "-", one that looks like | is "|", one that looks like V is "V", one that looks like < is "<", and so on.
+- Go down the page ONE WRITTEN LINE AT A TIME, and give each written line its own output line, in the same order. This matters most for lists, columns, or rows of marks: never gather similar-looking marks from different lines into a single row. For example, if three lines each have a dash and then a V, the output is three lines, each like "-   V" — not "- - -" followed by "V V V".
+- Follow the lines of the paper exactly. On lined (ruled) paper, every printed line from the first written line to the last becomes exactly one output line, and a printed line with nothing written on it becomes an empty output line — so the empty lines in your output match the empty lines on the page, one for one. If someone's writing is taller than one printed line, it still counts as one line. Don't add empty lines after the last written line. On unlined paper, do the same with the gaps between lines of writing: a gap the height of one line of writing becomes one empty line.
+- Keep the horizontal gaps too: reproduce indentation and the empty space between words or marks on a line using spaces, sized to the gap as it looks on the page (about one space for each letter-width of empty paper). For example, a dash at the start of a line and a V a few centimetres further along becomes something like "-          V". Never squeeze marks together, and never space them out evenly if they aren't evenly spaced on the page.
 - If a mark has no matching character (a small doodle or drawing), describe it briefly in square brackets, like [drawing: smiley face]. If you can see there is a mark but can't tell which symbol it is, write [mark?].
 - Scan the WHOLE page, edge to edge, including margins, corners, and lines below the main text, before you finish.
 - The photo may be rotated or taken at an angle. Read the writing in its natural direction, and keep the lines in the order the writer wrote them.
@@ -378,11 +453,6 @@ UPLOAD_FORM = """
     }
     .dropzone.dragover { background: #eef6ff; border-color: #3a7bd5; color: #3a7bd5; }
     .dropzone .filename { font-weight: bold; margin-top: 8px; color: #2a6f2a; }
-    .rotate-box { display: none; margin: 14px 0 4px; padding: 12px; background: #f7f2ea; border-radius: 10px; }
-    .rotate-hint { font-size: 0.85em; color: #6b5d4d; margin: 0 0 8px; }
-    .preview-frame { width: 220px; height: 220px; margin: 0 auto 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-    .preview-frame img { max-width: 200px; max-height: 200px; transition: transform 0.2s; border-radius: 4px; }
-    .rotate-box button { padding: 6px 12px; margin: 0 4px; cursor: pointer; }
     .camera-btn {
       display: inline-block; margin-top: 8px; font-size: 0.85em;
       color: #3a7bd5; text-decoration: underline; cursor: pointer; background: none; border: none;
@@ -419,14 +489,6 @@ UPLOAD_FORM = """
     <input type="file" name="photo" id="photoInput" accept="image/*" required style="display:none;">
     <button type="button" class="camera-btn" id="cameraBtn">Or take a photo now</button>
     <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
-    <div class="rotate-box" id="rotateBox">
-      <p class="rotate-hint">Is the writing upright? If not, turn it until it reads normally — every symbol and mark is read the way it faces, so this matters.</p>
-      <div class="preview-frame"><img id="previewImg" alt="Preview of your photo"></div>
-      <p class="rotate-hint" id="noPreview" style="display:none;">(No preview for this file type in your browser — rotating still works.)</p>
-      <button type="button" id="rotateLeft">↺ Rotate left</button>
-      <button type="button" id="rotateRight">Rotate right ↻</button>
-    </div>
-    <input type="hidden" name="rotate" id="rotateInput" value="0">
     <br>
     <input type="text" name="context" placeholder="Optional: language, topic, or hint (e.g. 'Lithuanian names and shift times')" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
     <button type="submit" id="submitBtn">Transcribe it</button>
@@ -442,35 +504,9 @@ UPLOAD_FORM = """
     const dropzoneText = document.getElementById('dropzoneText');
     const uploadForm = document.getElementById('uploadForm');
 
-    // Rotation: the preview just turns on screen; the real turning happens
-    // on the server, so it works for every format (even iPhone HEIC).
-    const rotateBox = document.getElementById('rotateBox');
-    const previewImg = document.getElementById('previewImg');
-    const noPreview = document.getElementById('noPreview');
-    const rotateInput = document.getElementById('rotateInput');
-    let rotation = 0;
-    let previewUrl = null;
-
-    function setRotation(deg) {
-      rotation = ((deg % 360) + 360) % 360;
-      rotateInput.value = rotation;
-      previewImg.style.transform = 'rotate(' + rotation + 'deg)';
-    }
-    document.getElementById('rotateLeft').addEventListener('click', () => setRotation(rotation - 90));
-    document.getElementById('rotateRight').addEventListener('click', () => setRotation(rotation + 90));
-
     function showChosenFile(file) {
       filenameLabel.textContent = file ? file.name : '';
       dropzoneText.textContent = file ? 'Photo selected — click to change' : 'Drag & drop a photo here, or click to browse';
-      setRotation(0);
-      if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
-      if (!file) { rotateBox.style.display = 'none'; return; }
-      previewUrl = URL.createObjectURL(file);
-      previewImg.style.display = '';
-      noPreview.style.display = 'none';
-      previewImg.onerror = () => { previewImg.style.display = 'none'; noPreview.style.display = 'block'; };
-      previewImg.src = previewUrl;
-      rotateBox.style.display = 'block';
     }
 
     // Click the dropzone to open the normal file picker.
@@ -542,7 +578,7 @@ RESULT_PAGE = """
     .card { max-width: 1040px; }
     .columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
     .columns img { max-width: min(460px, 100%); max-height: 80vh; border-radius: 8px; border: 1px solid #ddd; }
-    .result-content { background: #f7f2ea; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
+    .result-content { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.92em; line-height: 1.55; background: #f7f2ea; padding: 16px; border-radius: 8px; flex: 1; min-width: 300px; overflow-x: auto; }
     .promise { color: #2a6f2a; font-size: 0.9em; }
     .legend { font-size: 0.8em; color: #666; margin-top: 6px; }
     .legend span { color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px; }
@@ -557,7 +593,7 @@ RESULT_PAGE = """
 <body>
 <div class="card">
   <h1>Here's your text</h1>
-  <p>Compare side by side to check the right words were matched to the right part to the right part of the page:</p>
+  <p>Compare side by side to check the right words were matched to the right part of the page:</p>
   <div class="columns">
     <img src="data:{{ media_type }};base64,{{ image_b64 }}" alt="Your uploaded photo">
     <div class="result-content">{{ text }}</div>
@@ -1021,13 +1057,13 @@ def transcribe():
     # so it never touches the disk at all.
     original_bytes = uploaded_file.read()
     try:
-        try:
-            rotate_clockwise = int(request.form.get("rotate", "0"))
-        except ValueError:
-            rotate_clockwise = 0
-        image_bytes, media_type = shrink_image_if_needed(original_bytes, rotate_clockwise)
+        image_bytes, media_type = shrink_image_if_needed(original_bytes)
     except UnreadableImageError:
         return error_page("UNREADABLE")
+    # Photos of notebooks are often taken sideways or upside down. Turn the
+    # photo so the writing is upright before it gets read — no buttons for
+    # the visitor to press.
+    image_bytes = auto_orient(image_bytes)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
