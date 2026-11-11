@@ -35,13 +35,16 @@ v4 changes (November 2026):
 """
 
 import base64
+import hashlib
+import hmac
+import secrets
 import io
 import os
 import re
 import time
 from urllib.parse import quote
 
-from flask import Flask, redirect, render_template_string, request
+from flask import Flask, Request, make_response, redirect, render_template_string, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from markupsafe import Markup, escape
@@ -56,14 +59,28 @@ import anthropic
 # converted to JPEG like everything else.
 register_heif_opener()
 
+class InMemoryRequest(Request):
+    """Keep every upload in memory, never in a temporary file on disk.
+
+    By default Flask quietly writes any upload bigger than 500 KB (so almost
+    every phone photo) to a temporary file on the server's disk while the
+    request is processed. It's deleted afterwards, but it still breaks the
+    "your photo never touches the disk" promise. This keeps it in RAM only.
+    """
+
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        return io.BytesIO()
+
+
 app = Flask(__name__)
+app.request_class = InMemoryRequest
 
 # Render (like most hosts) sits your app behind a reverse proxy, so without
 # this, Flask sees the proxy's own IP for every single visitor instead of
 # each person's real IP — which would make the rate limit below either
 # useless (everyone shares one bucket) or wrong. This tells Flask to trust
 # the standard X-Forwarded-For header the proxy sets.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # x_proto: know when visitors use https
 
 # Every hit to /transcribe costs real money (an Opus API call). Without a
 # limit, someone impatiently spam-clicking — or a bot — could burn through
@@ -80,7 +97,10 @@ limiter = Limiter(
 # Reject uploads bigger than 25 MB outright — generous enough for a real
 # phone photo (which we then shrink below), while still blocking anything
 # absurd.
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # room for several pages in one Premium upload
+
+# Premium "many pages at once": most pages in one go.
+MAX_PAGES = 10
 
 # Handwriting doesn't need a 12-megapixel photo to be read accurately —
 # anything beyond this on the longest edge is wasted size and wasted money.
@@ -105,6 +125,70 @@ PRIMARY_MODEL = "claude-opus-5-5"
 # accuracy for a fraction of the cost, and far better than Haiku for
 # reading messy handwriting carefully. Only ever used as a last resort.
 FALLBACK_MODEL = "claude-sonnet-5-5"
+
+
+# ---------------------------------------------------------------- Premium
+# Premium is unlocked with a signed key, so no database is needed: each key
+# carries its own expiry date plus a "seal" made with PREMIUM_KEY_SECRET.
+# Nobody can make a valid key without that secret, and nothing about the
+# visitor has to be stored anywhere.
+#
+# Settings (in Render -> Environment):
+#   PREMIUM_KEY_SECRET  a long random password. Without it, Premium is off.
+#   ADMIN_PASSWORD      opens /admin, where you can make keys by hand.
+#   PREMIUM_PUBLIC      set to 1 to show the "unlock with a key" box to
+#                       everyone. Until then visitors only see "Coming soon",
+#                       but an unlock link still works, for testing.
+PREMIUM_KEY_SECRET = os.environ.get("PREMIUM_KEY_SECRET", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+PREMIUM_PUBLIC = os.environ.get("PREMIUM_PUBLIC", "") == "1"
+PREMIUM_COOKIE = "hq_premium"
+# The three passes. "1 month" is 31 days so nobody loses a day.
+PASSES = {"1 day": 1, "7 days": 7, "1 month": 31}
+
+
+def _key_seal(payload: bytes) -> bytes:
+    return hmac.new(PREMIUM_KEY_SECRET.encode(), b"hq-premium-v1" + payload, hashlib.sha256).digest()[:10]
+
+
+def make_premium_key(days: int) -> str:
+    """Create a key that unlocks Premium for `days` days from now."""
+    expires = int(time.time()) + days * 86400
+    payload = expires.to_bytes(5, "big") + secrets.token_bytes(3)  # random part: every key is different
+    code = base64.b32encode(payload + _key_seal(payload)).decode().rstrip("=")
+    return "HQ-" + "-".join(code[i:i + 4] for i in range(0, len(code), 4))
+
+
+def premium_key_expiry(key: str) -> int | None:
+    """When a key runs out (unix time), or None if the key isn't genuine.
+
+    Doesn't check whether it has already expired — see premium_until().
+    """
+    if not PREMIUM_KEY_SECRET or not key:
+        return None
+    code = re.sub(r"[^A-Z2-7]", "", key.upper().removeprefix("HQ-").removeprefix("HQ"))
+    try:
+        raw = base64.b32decode(code + "=" * (-len(code) % 8))
+    except ValueError:
+        return None
+    if len(raw) != 18:
+        return None
+    payload, seal = raw[:8], raw[8:]
+    if not hmac.compare_digest(seal, _key_seal(payload)):
+        return None
+    return int.from_bytes(payload[:5], "big")
+
+
+def premium_until() -> int | None:
+    """Expiry time of this visitor's Premium pass, or None if they have none."""
+    expires = premium_key_expiry(request.cookies.get(PREMIUM_COOKIE, ""))
+    if expires and expires > time.time():
+        return expires
+    return None
+
+
+def nice_date(unix_time: int) -> str:
+    return time.strftime("%d %B %Y", time.gmtime(unix_time)).lstrip("0")
 
 
 class UnreadableImageError(Exception):
@@ -245,7 +329,11 @@ def auto_orient(image_bytes: bytes) -> bytes:
 # environment variable instead (see README.md).
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-def build_prompt(context_hint: str, previous_guess: str = "") -> str:
+DEFAULT_INTRO = "You are transcribing a photo of handwritten text as accurately as possible."
+DEFAULT_OUTRO = '- Return ONLY the transcription. No commentary, no "Here is the transcription:", nothing else.'
+
+
+def build_prompt(context_hint: str, previous_guess: str = "", intro: str = DEFAULT_INTRO, outro: str = DEFAULT_OUTRO) -> str:
     hint_line = ""
     if context_hint.strip():
         hint_line = (
@@ -267,7 +355,7 @@ you're still not sure, use word[?] rather than defaulting back to the
 previous guess out of habit.
 """
 
-    return f"""You are transcribing a photo of handwritten text as accurately as possible.
+    return f"""{intro}
 {hint_line}{rethink_line}
 Rules:
 - Transcribe EXACTLY what is written, preserving original spelling, punctuation, and line breaks.
@@ -286,11 +374,83 @@ Rules:
 - Scan the WHOLE page, edge to edge, including margins, corners, and lines below the main text, before you finish.
 - The photo may be rotated or taken at an angle. Read the writing in its natural direction, and keep the lines in the order the writer wrote them.
 - Preserve the layout as closely as possible (line breaks, bullet points, indentation).
-- Return ONLY the transcription. No commentary, no "Here is the transcription:", nothing else.
+{outro}
 """
 
 
-def call_model_with_retries(model: str, media_type: str, image_b64: str, prompt: str, retries: int = 3):
+def build_pages_prompt(page_count: int, context_hint: str, follow_story: bool) -> str:
+    """Prompt for several pages read together in one go (Premium)."""
+    intro = (
+        f"You are transcribing {page_count} photos of handwritten pages as accurately as possible. "
+        "They are given in order: Page 1 first, then Page 2, and so on. The person arranged them "
+        "in this order on purpose, so treat it as the order they were written in."
+    )
+    if follow_story:
+        intro += """
+
+Before you transcribe, look across ALL the pages and work out whether they belong together as one continuous piece: for example a diary or journal with dates, a schedule or log with times, a story or letter, or notes and lists that carry on from one page to the next. If they do, use that connection to read unclear handwriting more accurately:
+- Dates, days and times should make sense in sequence. For example, if page 1 ends on "Mon 3 March", a smudged date at the start of page 2 is more likely "Tue 4 March" than "Tue 14 March".
+- Names, places and repeated words should be read the same way on every page.
+- A sentence cut off at the bottom of one page usually continues at the top of the next.
+Use this context ONLY to choose between possible readings of unclear handwriting. Never add, change or "fix" anything that is clearly written, and never move text from one page to another. If the pages are not connected, simply transcribe each one on its own."""
+    outro = (
+        "- Output format (follow it exactly): start each page with a line \"=== PAGE n ===\" (n is the page number), "
+        "followed by that page's transcription, using every rule above. After the last page, write a line "
+        "\"=== NOTES ===\" followed by one or two short, plain sentences for the person"
+        + (
+            ": what kind of document this seems to be (for example \"Diary entries from 3 to 9 March.\" or "
+            "\"These pages don't seem to be connected.\"), and, only if the pages look out of order, which order "
+            "seems right and why (for example \"Page 3 may come before page 2: its date is earlier.\")."
+            if follow_story else
+            ", only if something important needs pointing out (otherwise leave the notes empty)."
+        )
+        + " No other commentary anywhere."
+    )
+    return build_prompt(context_hint, intro=intro, outro=outro)
+
+
+def split_pages(text: str, page_count: int) -> tuple[list[str] | None, str]:
+    """Split a several-page answer into one text per page, plus the notes."""
+    notes = ""
+    notes_match = re.search(r"^=== NOTES ===[ \t]*$", text, re.M)
+    if notes_match:
+        notes = text[notes_match.end():].strip()
+        text = text[:notes_match.start()]
+    parts = re.split(r"^=== PAGE (\d+) ===[ \t]*$", text, flags=re.M)
+    found = {}
+    for i in range(1, len(parts) - 1, 2):
+        found[int(parts[i])] = parts[i + 1].strip("\n")
+    if not found:
+        return None, notes
+    return [found.get(n, "") for n in range(1, page_count + 1)], notes
+
+
+def image_block(media_type: str, image_b64: str) -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}}
+
+
+def read_with_fallback(content: list, max_tokens: int = 8192):
+    """Ask the best model, retrying through brief overloads, then the backup
+    model if it's still overloaded. Returns (message, used_fallback)."""
+    try:
+        return call_model_with_retries(PRIMARY_MODEL, content, max_tokens=max_tokens), False
+    except anthropic.OverloadedError:
+        # Different models are usually served with separate capacity, so the
+        # backup can often succeed even when the best one can't.
+        app.logger.warning("Opus overloaded after retries, falling back to %s", FALLBACK_MODEL)
+        return call_model_with_retries(FALLBACK_MODEL, content, retries=2, max_tokens=max_tokens), True
+
+
+def message_text(message) -> str:
+    """The answer's text. The model sometimes returns a "thinking" block
+    first, so look for the first block that's actually text."""
+    text = next((block.text for block in message.content if block.type == "text"), None)
+    if text is None:
+        raise EmptyTranscriptionError("The model didn't return any readable text.")
+    return text
+
+
+def call_model_with_retries(model: str, content: list, retries: int = 3, max_tokens: int = 8192):
     """Ask a specific model to read the image, retrying through brief 529
     "Overloaded" errors before giving up on that model.
 
@@ -307,23 +467,8 @@ def call_model_with_retries(model: str, media_type: str, image_b64: str, prompt:
                 # "thinking" before it writes the actual transcription, so a
                 # dense full page of handwriting could get cut off with a
                 # smaller limit.
-                max_tokens=8192,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": image_b64,
-                                },
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    }
-                ],
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": content}],
             )
         except anthropic.OverloadedError as exc:
             last_overload_error = exc
@@ -458,6 +603,36 @@ UPLOAD_FORM = """
       color: #3a7bd5; text-decoration: underline; cursor: pointer; background: none; border: none;
     }
     .contact-footer { margin-top: 30px; font-size: 0.85em; color: #999; }
+    .premium { margin-top: 28px; text-align: left; border: 1px dashed #d8c7a8; border-radius: 12px; padding: 16px 18px; background: #fdf8ef; }
+    .premium-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .premium-head h2 { font-size: 1.05em; margin: 0; }
+    .soon-badge { flex-shrink: 0; font-size: 0.72em; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: #8a5a00; background: #ffeec7; border-radius: 999px; padding: 4px 10px; }
+    .premium ul { list-style: none; margin: 0; padding: 0; }
+    .premium li { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid #f0e6d4; opacity: 0.85; }
+    .premium li:first-child { border-top: none; }
+    .premium .feat-icon { font-size: 1.2em; line-height: 1.3; }
+    .premium .feat-title { font-weight: 600; }
+    .premium .feat-desc { font-size: 0.85em; color: #6b5d4d; }
+    .premium-foot { font-size: 0.8em; color: #8a8178; margin: 10px 0 0; }
+    .premium-on { border-style: solid; border-color: #cfe3c6; background: #fbfdf8; }
+    .active-badge { flex-shrink: 0; font-size: 0.72em; font-weight: 700; color: #2a6f2a; background: #e3f2dc; border-radius: 999px; padding: 4px 10px; }
+    .unlocked-msg { background: #e9f6e4; color: #2a6f2a; border-radius: 8px; padding: 8px 12px; font-size: 0.9em; margin: 0 0 10px; }
+    .premium-on form { text-align: center; }
+    .order-hint { font-size: 0.85em; color: #6b5d4d; margin: 10px 0 4px; }
+    .page-list { list-style: none; margin: 8px 0; padding: 0; text-align: left; }
+    .page-list li { display: flex; align-items: center; gap: 10px; background: #fff; border: 1px solid #ece3d4; border-radius: 8px; padding: 6px 8px; margin: 6px 0; cursor: grab; }
+    .page-list li.dragging { opacity: 0.4; }
+    .page-list li.drop-target { border-color: #3a7bd5; box-shadow: 0 0 0 2px #cfe0f7; }
+    .page-list .num { font-weight: 700; color: #8a5a00; min-width: 1.6em; text-align: center; }
+    .page-list .thumb { width: 52px; height: 52px; object-fit: cover; border-radius: 4px; background: #f0e9dd; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 0.7em; color: #8a8178; }
+    .page-list .name { flex: 1; font-size: 0.85em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .page-list .ctrls button { padding: 4px 9px; font-size: 0.9em; margin-left: 2px; }
+    .story-opt { display: flex; gap: 10px; align-items: flex-start; text-align: left; font-size: 0.9em; margin: 12px 0 4px; cursor: pointer; }
+    .story-opt input { margin-top: 4px; }
+    .story-opt small { color: #6b5d4d; }
+    .key-form { display: flex; gap: 8px; margin-top: 12px; }
+    .key-form input { flex: 1; min-width: 0; padding: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .key-form button { padding: 8px 14px; }
     .contact-footer a { color: #3a7bd5; }
   </style>
 </head>
@@ -494,6 +669,59 @@ UPLOAD_FORM = """
     <button type="submit" id="submitBtn">Transcribe it</button>
     <div class="wake-status" id="wakeStatus"></div>
   </form>
+
+  {% if premium_until %}
+  <section class="premium premium-on" id="premium" aria-label="Premium">
+    <div class="premium-head">
+      <h2>Premium: many pages</h2>
+      <span class="active-badge">Active until {{ premium_until }}</span>
+    </div>
+    {% if just_unlocked %}<p class="unlocked-msg">Premium unlocked. Welcome, and thank you for your support!</p>{% endif %}
+    <form method="post" enctype="multipart/form-data" action="/transcribe-pages" id="pagesForm">
+      <div class="dropzone" id="pagesDrop">
+        <div>Drag &amp; drop up to {{ max_pages }} page photos here, or click to choose</div>
+      </div>
+      <input type="file" name="photos" id="pagesInput" accept="image/*" multiple style="display:none;">
+      <p class="order-hint" id="orderHint" hidden>Put the pages in the order they were written: drag them, or use ↑ ↓.</p>
+      <ol class="page-list" id="pageList"></ol>
+      <label class="story-opt">
+        <input type="checkbox" name="follow_story" value="1" checked>
+        <span><strong>Follow the story across pages</strong><br>
+        <small>Uses dates, times and the flow of the writing to read unclear words. Turn off if the pages aren't connected.</small></span>
+      </label>
+      <input type="text" name="context" placeholder="Optional: language, topic, or hint" style="width: 90%; padding: 8px; margin: 10px 0;"><br>
+      <button type="submit" id="pagesBtn">Transcribe pages</button>
+      <div class="wake-status" id="pagesWake"></div>
+    </form>
+  </section>
+  {% else %}
+  <section class="premium" id="premium" aria-label="Premium features coming soon">
+    <div class="premium-head">
+      <h2>Premium</h2>
+      <span class="soon-badge">Coming soon</span>
+    </div>
+    <ul>
+      <li><span class="feat-icon" aria-hidden="true">🗂️</span><div>
+        <div class="feat-title">Many pages at once</div>
+        <div class="feat-desc">Upload a whole notebook or diary in one go and get all the text back together.</div></div></li>
+      <li><span class="feat-icon" aria-hidden="true">📖</span><div>
+        <div class="feat-title">Follows the story</div>
+        <div class="feat-desc">Reads all pages together and uses dates, times and the flow of the writing to read unclear words more accurately.</div></div></li>
+      <li><span class="feat-icon" aria-hidden="true">↕️</span><div>
+        <div class="feat-title">Put pages in order</div>
+        <div class="feat-desc">Drag your photos into the right order before reading, for the most accurate result.</div></div></li>
+    </ul>
+    {% if premium_public %}
+    <form method="post" action="/unlock" class="key-form">
+      <input type="text" name="key" placeholder="Have a key? HQ-XXXX-XXXX-…" autocomplete="off" required>
+      <button type="submit">Unlock</button>
+    </form>
+    <p class="premium-foot">Passes for 1 day, 7 days or 1 month on <a href="{{ kofi_url }}" target="_blank" rel="noopener">Ko-fi</a>. Your key arrives by email.</p>
+    {% else %}
+    <p class="premium-foot">Not available yet. Supporters on Ko-fi will get access first.</p>
+    {% endif %}
+  </section>
+  {% endif %}
   <script>
     __WAKE_SCRIPT__
     const dropzone = document.getElementById('dropzone');
@@ -546,6 +774,81 @@ UPLOAD_FORM = """
         showChosenFile(cameraInput.files[0]);
       }
     });
+
+    // ---------------- Premium: many pages, in the visitor's chosen order
+    const pagesForm = document.getElementById('pagesForm');
+    if (pagesForm) {
+      const MAX_PAGES = {{ max_pages }};
+      const pagesInput = document.getElementById('pagesInput');
+      const pagesDrop = document.getElementById('pagesDrop');
+      const pageList = document.getElementById('pageList');
+      const orderHint = document.getElementById('orderHint');
+      const pagesBtn = document.getElementById('pagesBtn');
+      const pages = [];  // {file, url} in reading order
+      let dragFrom = null;
+
+      function addPages(files) {
+        for (const file of files) {
+          const isImage = file.type.startsWith('image/') || /\\.(heic|heif)$/i.test(file.name);
+          if (!isImage) continue;
+          if (pages.length >= MAX_PAGES) { alert('You can read up to ' + MAX_PAGES + ' pages at once.'); break; }
+          pages.push({ file: file, url: URL.createObjectURL(file) });
+        }
+        renderPages();
+      }
+
+      function move(from, to) {
+        if (to < 0 || to >= pages.length || from === to) return;
+        const [item] = pages.splice(from, 1);
+        pages.splice(to, 0, item);
+        renderPages();
+      }
+
+      function renderPages() {
+        pageList.innerHTML = '';
+        pages.forEach((page, i) => {
+          const li = document.createElement('li');
+          li.draggable = true;
+          const num = document.createElement('span'); num.className = 'num'; num.textContent = i + 1;
+          const thumb = document.createElement('img'); thumb.className = 'thumb'; thumb.alt = '';
+          thumb.src = page.url;
+          thumb.onerror = () => { const ph = document.createElement('span'); ph.className = 'thumb'; ph.textContent = 'photo'; thumb.replaceWith(ph); };
+          const name = document.createElement('span'); name.className = 'name'; name.textContent = page.file.name;
+          const ctrls = document.createElement('span'); ctrls.className = 'ctrls';
+          [['↑', 'Move up', () => move(i, i - 1)], ['↓', 'Move down', () => move(i, i + 1)],
+           ['✕', 'Remove', () => { URL.revokeObjectURL(page.url); pages.splice(i, 1); renderPages(); }]
+          ].forEach(([label, title, action]) => {
+            const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.title = title;
+            b.setAttribute('aria-label', title + ' (page ' + (i + 1) + ')');
+            b.addEventListener('click', action); ctrls.appendChild(b);
+          });
+          li.append(num, thumb, name, ctrls);
+          li.addEventListener('dragstart', () => { dragFrom = i; li.classList.add('dragging'); });
+          li.addEventListener('dragend', () => li.classList.remove('dragging'));
+          li.addEventListener('dragover', (e) => { e.preventDefault(); li.classList.add('drop-target'); });
+          li.addEventListener('dragleave', () => li.classList.remove('drop-target'));
+          li.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); li.classList.remove('drop-target'); if (dragFrom !== null) move(dragFrom, i); dragFrom = null; });
+          pageList.appendChild(li);
+        });
+        orderHint.hidden = pages.length < 2;
+        pagesBtn.textContent = pages.length > 1 ? 'Transcribe ' + pages.length + ' pages' : 'Transcribe pages';
+      }
+
+      pagesDrop.addEventListener('click', () => pagesInput.click());
+      pagesInput.addEventListener('change', () => { addPages(pagesInput.files); pagesInput.value = ''; });
+      ['dragenter', 'dragover'].forEach(evt => pagesDrop.addEventListener(evt, (e) => { e.preventDefault(); pagesDrop.classList.add('dragover'); }));
+      ['dragleave', 'drop'].forEach(evt => pagesDrop.addEventListener(evt, (e) => { e.preventDefault(); pagesDrop.classList.remove('dragover'); }));
+      pagesDrop.addEventListener('drop', (e) => addPages(e.dataTransfer.files));
+
+      protectForm(pagesForm, pagesBtn, 'Reading your pages... (about 20 seconds per page)', document.getElementById('pagesWake'), () => {
+        if (!pages.length) { alert('Please choose your page photos first.'); return false; }
+        // Put the files into the form in exactly the order shown.
+        const ordered = new DataTransfer();
+        pages.forEach(page => ordered.items.add(page.file));
+        pagesInput.files = ordered.files;
+        return true;
+      });
+    }
 
     protectForm(
       uploadForm,
@@ -655,6 +958,107 @@ RESULT_PAGE = """
 </html>
 """
 
+PAGES_RESULT = """
+<!doctype html>
+<html>
+<head><title>Your Pages</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    __PAGE_STYLE__
+    .card { max-width: 1040px; }
+    .columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+    .columns img { max-width: min(420px, 100%); max-height: 70vh; border-radius: 8px; border: 1px solid #ddd; }
+    .result-content { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.92em; line-height: 1.55; background: #f7f2ea; padding: 16px; border-radius: 8px; flex: 1; min-width: 280px; overflow-x: auto; }
+    .page-block { margin-top: 28px; padding-top: 18px; border-top: 1px solid #ece3d4; }
+    .page-block h2 { font-size: 1.1em; margin: 0 0 12px; color: #8a5a00; }
+    .notes { background: #eef4fb; border-radius: 10px; padding: 12px 16px; color: #2b4a6f; }
+    .notes strong { display: block; margin-bottom: 4px; }
+    .warn { font-size: 0.85em; color: #a06a00; background: #fff8e6; padding: 8px 12px; border-radius: 6px; }
+    .legend { font-size: 0.8em; color: #666; margin-top: 6px; }
+    .legend span { color:#c0392b; font-weight:bold; background:#fdecea; padding:0 2px; border-radius:3px; }
+    .edit-box { margin-top: 30px; }
+    .edit-box textarea { width: 100%; min-height: 220px; font-family: monospace; font-size: 0.95em; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
+    .edit-box button { margin-top: 8px; padding: 6px 14px; cursor: pointer; }
+    .promise { color: #2a6f2a; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Here are your {{ pages|length }} pages</h1>
+  {% if notes %}<div class="notes"><strong>What the tool noticed</strong>{{ notes }}</div>{% endif %}
+  {% if truncated %}<p class="warn">This was a lot of writing for one go, so the end may be cut off. If the last page looks incomplete, read it again on its own.</p>{% endif %}
+  {% if used_fallback_model %}<p class="warn">Text recognition was briefly overloaded with demand, so the tool read these in backup mode. Worth a quick double-check.</p>{% endif %}
+  {% for page in pages %}
+  <div class="page-block">
+    <h2>Page {{ loop.index }}</h2>
+    <div class="columns">
+      <img src="data:{{ page.media_type }};base64,{{ page.image_b64 }}" alt="Photo of page {{ loop.index }}">
+      <div class="result-content">{{ page.html }}</div>
+    </div>
+  </div>
+  {% endfor %}
+  <p class="legend"><span>Highlighted text</span> means the tool wasn't fully sure — worth double-checking against the photo.</p>
+  <div class="edit-box">
+    <p style="font-size:0.9em; color:#555; margin-bottom:4px;">All pages as plain text, ready to edit or copy:</p>
+    <textarea id="editableText">{{ all_text }}</textarea><br>
+    <button type="button" id="copyBtn">Copy all pages</button>
+    <span id="copyStatus" style="font-size:0.85em; color:#2a6f2a; margin-left:8px;"></span>
+  </div>
+  <p class="promise" style="margin-top:24px;">These photos were never saved — they're only shown here, in your own browser, for this one page. Once you leave or refresh, they're gone for good.</p>
+  <a href="/#premium">Read more pages</a>
+  <script>
+    document.getElementById('copyBtn').addEventListener('click', () => {
+      navigator.clipboard.writeText(document.getElementById('editableText').value).then(() => {
+        const status = document.getElementById('copyStatus');
+        status.textContent = 'Copied!';
+        setTimeout(() => { status.textContent = ''; }, 2000);
+      });
+    });
+  </script>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_PAGE = """
+<!doctype html>
+<html>
+<head><title>Admin — Premium keys</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <style>
+    __PAGE_STYLE__
+    .card { max-width: 560px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input, select { padding: 8px; font-size: 1em; width: 100%; box-sizing: border-box; }
+    button { margin-top: 14px; padding: 10px 20px; font-size: 1em; cursor: pointer; }
+    .key { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 1.1em; background: #f7f2ea; padding: 12px; border-radius: 8px; word-break: break-all; }
+    .bad { color: #a33; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Make a Premium key</h1>
+  {% if error %}<p class="bad">{{ error }}</p>{% endif %}
+  {% if key %}
+  <p>Key for <strong>{{ pass_name }}</strong>, valid until {{ until }}:</p>
+  <p class="key">{{ key }}</p>
+  <p>One-click unlock link (opening it unlocks Premium in that browser):</p>
+  <p class="key">{{ link }}</p>
+  <hr>
+  {% endif %}
+  <form method="post" action="/admin">
+    <label for="pw">Admin password</label>
+    <input type="password" id="pw" name="password" required autocomplete="current-password">
+    <label for="pass">Pass</label>
+    <select id="pass" name="pass">{% for name in passes %}<option>{{ name }}</option>{% endfor %}</select>
+    <button type="submit">Make key</button>
+  </form>
+</div>
+</body>
+</html>
+"""
+
 ERROR_PAGE = """
 <!doctype html>
 <html>
@@ -669,6 +1073,7 @@ ERROR_PAGE = """
     .whose-server { background: #e8f1fb; color: #2b5d9a; }
     .whose-photo  { background: #fff3dc; color: #8a5a00; }
     .whose-wait   { background: #eef6ea; color: #2a6f2a; }
+    .whose-key    { background: #f3ecfb; color: #6a3d9a; }
     .todo { background: #f7f2ea; border-radius: 8px; padding: 10px 14px; }
     .err-footer { margin-top: 28px; font-size: 0.85em; color: #8a8178; }
     .err-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.95em; color: #6b5d4d; }
@@ -696,9 +1101,9 @@ ERROR_PAGE = """
 """
 
 # Drop the shared style and wake-up script into each page.
-UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE = (
+UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE, PAGES_RESULT, ADMIN_PAGE = (
     page.replace("__PAGE_STYLE__", PAGE_STYLE).replace("__WAKE_SCRIPT__", WAKE_SCRIPT)
-    for page in (UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE)
+    for page in (UPLOAD_FORM, RESULT_PAGE, ERROR_PAGE, PAGES_RESULT, ADMIN_PAGE)
 )
 
 
@@ -730,6 +1135,7 @@ WHOSE_TEXT = {
     "server": "Your photo is fine — this problem is on our side.",
     "photo": "This is about the photo itself.",
     "wait": "Nothing is broken — it just needs a short wait.",
+    "key": "This is about your Premium pass.",
 }
 
 # Every error the visitor can see: code -> (whose, heading, what happened, what to do).
@@ -761,6 +1167,18 @@ ERRORS = {
     "PHOTO_REJECTED": ("photo", "This photo couldn't be accepted",
         "Text recognition refused this image. It may be too large, in an unusual format, or damaged.",
         "Try a JPG or PNG photo, or take a screenshot of your photo and upload that instead."),
+    "TOO_MANY_PAGES": ("photo", "Too many pages at once",
+        f"You can read up to {MAX_PAGES} pages in one go.",
+        f"Go back and remove some pages, then read the rest in a second batch."),
+    "PREMIUM_NEEDED": ("key", "This needs Premium",
+        "Reading many pages at once is a Premium feature, and there's no active Premium pass in this browser.",
+        "If you have a key, use the unlock link from your email again, in the browser you want to use."),
+    "KEY_INVALID": ("key", "That key doesn't work",
+        "The key wasn't recognised. It may be incomplete, or have a typo in it.",
+        "Copy the key again from your email, including the HQ- at the start, or use the unlock button in it."),
+    "KEY_EXPIRED": ("key", "That Premium pass has ended",
+        "This key was genuine, but its time is up.",
+        "Get a new pass to keep using Premium. Single photos are always free."),
     "NO_TEXT": ("photo", "No text came back",
         "The tool read your photo but couldn't find any text. This can happen if there's no readable "
         "writing in it, or the photo is very dark, blurry, or taken from far away.",
@@ -777,8 +1195,8 @@ ERRORS = {
     "UNREADABLE": ("photo", "We couldn't open that photo",
         "The file may be damaged or in a format we can't read.",
         "Try again with a JPG or PNG. Taking a screenshot of the photo and uploading that usually works too."),
-    "TOO_LARGE": ("photo", "That file is too large",
-        "Photos can be up to 25 MB, and this one is bigger.",
+    "TOO_LARGE": ("photo", "That upload is too large",
+        "Uploads can be up to 60 MB in total, and this one is bigger.",
         "Choose a smaller photo, or take a screenshot of it and upload that."),
     "LIMIT": ("wait", "Please slow down a little",
         "You've sent a lot of photos in a short time, so this free tool is pausing you briefly "
@@ -810,7 +1228,7 @@ def classify_error(exc: Exception) -> str:
     return "UNKNOWN"
 
 
-def error_page(code: str, status: int = 200):
+def error_page(code: str, status: int = 200, page: int | None = None):
     """Render the error page for one of the ERRORS codes.
 
     The error code shown on the page includes the time (UTC), so when
@@ -818,6 +1236,8 @@ def error_page(code: str, status: int = 200):
     Render's logs.
     """
     whose, title, what, todo = ERRORS[code]
+    if page:
+        what = f"The problem is with page {page}. {what}"
     stamped_code = f"{code} · {time.strftime('%Y-%m-%d %H:%M', time.gmtime())} UTC"
     return render_template_string(
         ERROR_PAGE,
@@ -1022,9 +1442,57 @@ def rate_limited(_error):
 
 @app.route("/")
 def index():
+    expires = premium_until()
     return render_template_string(
-        UPLOAD_FORM, contact_email=CONTACT_EMAIL, kofi_url=KOFI_URL
+        UPLOAD_FORM,
+        contact_email=CONTACT_EMAIL,
+        kofi_url=KOFI_URL,
+        premium_until=nice_date(expires) if expires else None,
+        just_unlocked=request.args.get("unlocked") == "1",
+        premium_public=PREMIUM_PUBLIC and bool(PREMIUM_KEY_SECRET),
+        max_pages=MAX_PAGES,
     )
+
+
+@app.route("/unlock", methods=["GET", "POST"])
+@limiter.limit("20 per hour")
+def unlock():
+    """Unlock Premium in this browser, from the link in the email (GET) or
+    the key box on the upload page (POST). The key is kept in a cookie."""
+    key = (request.values.get("key") or "").strip()
+    expires = premium_key_expiry(key)
+    if not expires:
+        return error_page("KEY_INVALID")
+    if expires <= time.time():
+        return error_page("KEY_EXPIRED")
+    response = make_response(redirect("/?unlocked=1#premium"))
+    response.set_cookie(
+        PREMIUM_COOKIE, key, max_age=int(expires - time.time()),
+        httponly=True, secure=request.is_secure, samesite="Lax",
+    )
+    return response
+
+
+@app.route("/admin", methods=["GET", "POST"])
+@limiter.limit("10 per minute", methods=["POST"])
+def admin():
+    """Make Premium keys by hand (for testing, gifts or fixing problems).
+    Hidden unless ADMIN_PASSWORD and PREMIUM_KEY_SECRET are both set."""
+    if not (ADMIN_PASSWORD and PREMIUM_KEY_SECRET):
+        return redirect("/")
+    page = dict(passes=list(PASSES))
+    if request.method == "POST":
+        if not hmac.compare_digest(request.form.get("password", "").encode(), ADMIN_PASSWORD.encode()):
+            app.logger.warning("Admin: wrong password attempt")
+            page["error"] = "Wrong password."
+        else:
+            pass_name = request.form.get("pass", "1 day")
+            days = PASSES.get(pass_name, 1)
+            key = make_premium_key(days)
+            page.update(key=key, pass_name=pass_name,
+                        until=nice_date(premium_key_expiry(key)),
+                        link=request.host_url + "unlock?key=" + key)
+    return render_template_string(ADMIN_PAGE, **page)
 
 
 @app.route("/health")
@@ -1040,6 +1508,104 @@ def transcribe_reload():
     Render's wake-up screen. There's no photo to read, so just send them
     back to the start instead of showing a "Method Not Allowed" error."""
     return redirect("/")
+
+
+def reading_failed(exc: Exception):
+    """The page to show when reading failed. The real error goes to
+    Render's logs only, never to the visitor's screen."""
+    if is_budget_error(exc):
+        app.logger.exception("Transcription failed [BUDGET]: %s", exc)
+        return render_template_string(
+            ERROR_PAGE,
+            budget=True,
+            title=BUDGET_ERROR_TITLE,
+            error=BUDGET_ERROR_MESSAGE,
+            contact_email=CONTACT_EMAIL,
+            kofi_url=KOFI_URL,
+        )
+    code = classify_error(exc)
+    app.logger.exception("Transcription failed [%s]: %s", code, exc)
+    return error_page(code)
+
+
+@app.route("/transcribe-pages", methods=["GET"])
+def transcribe_pages_reload():
+    return redirect("/#premium")
+
+
+@app.route("/transcribe-pages", methods=["POST"])
+@limiter.limit("3 per minute; 20 per day")
+def transcribe_pages():
+    """Premium: read several pages, in the order the visitor arranged them."""
+    if not premium_until():
+        return error_page("PREMIUM_NEEDED")
+    uploads = [f for f in request.files.getlist("photos") if f and f.filename]
+    if not uploads:
+        return error_page("NO_PHOTO")
+    if len(uploads) > MAX_PAGES:
+        return error_page("TOO_MANY_PAGES")
+
+    pages = []
+    for number, upload in enumerate(uploads, start=1):
+        if not (upload.mimetype or "").startswith("image/"):
+            return error_page("NOT_IMAGE", page=number)
+        try:
+            image_bytes, media_type = shrink_image_if_needed(upload.read())
+        except UnreadableImageError:
+            return error_page("UNREADABLE", page=number)
+        image_b64 = base64.b64encode(auto_orient(image_bytes)).decode("utf-8")
+        pages.append({"media_type": media_type, "image_b64": image_b64})
+
+    context_hint = request.form.get("context", "")[:MAX_CONTEXT_LENGTH]
+    follow_story = request.form.get("follow_story") == "1"
+    notes, truncated, used_fallback = "", False, False
+    try:
+        if len(pages) == 1:
+            message, used_fallback = read_with_fallback(
+                [image_block(pages[0]["media_type"], pages[0]["image_b64"]), {"type": "text", "text": build_prompt(context_hint)}])
+            texts = [message_text(message)]
+            truncated = message.stop_reason == "max_tokens"
+        elif follow_story:
+            # All pages in one request, so the story can be followed across them.
+            content = []
+            for number, page in enumerate(pages, start=1):
+                content += [{"type": "text", "text": f"Page {number}:"}, image_block(page["media_type"], page["image_b64"])]
+            content.append({"type": "text", "text": build_pages_prompt(len(pages), context_hint, follow_story=True)})
+            message, used_fallback = read_with_fallback(content, max_tokens=16000)
+            texts, notes = split_pages(message_text(message), len(pages))
+            truncated = message.stop_reason == "max_tokens"
+            if texts is None:
+                # The answer didn't come back split into pages; show it all
+                # on page 1 rather than losing it.
+                texts = [message_text(message)] + [""] * (len(pages) - 1)
+                notes = "The pages came back as one block of text, so it's all shown under page 1."
+        else:
+            # Pages read one by one, each on its own.
+            texts = []
+            for page in pages:
+                message, fallback = read_with_fallback(
+                    [image_block(page["media_type"], page["image_b64"]), {"type": "text", "text": build_prompt(context_hint)}])
+                texts.append(message_text(message))
+                used_fallback = used_fallback or fallback
+                truncated = truncated or message.stop_reason == "max_tokens"
+    except Exception as exc:  # noqa: BLE001 — never show a raw technical error to a stranger
+        return reading_failed(exc)
+
+    for page, text in zip(pages, texts):
+        page["html"] = format_transcription(text)
+    all_text = "\n\n".join(
+        f"— Page {number} —\n{clean_text_for_copy(text)}" for number, text in enumerate(texts, start=1)
+    )
+    # Rendered once, straight back into this response — never written to a
+    # file, database, or log.
+    return render_template_string(
+        PAGES_RESULT,
+        pages=pages,
+        notes=notes,
+        all_text=all_text,
+        truncated=truncated,
+        used_fallback_model=used_fallback,
+    )
 
 
 @app.route("/transcribe", methods=["POST"])
@@ -1069,49 +1635,13 @@ def transcribe():
     previous_guess = request.form.get("previous_guess", "")[:MAX_CONTEXT_LENGTH]
 
     prompt = build_prompt(context_hint, previous_guess)
-    used_fallback_model = False
 
     try:
-        try:
-            message = call_model_with_retries(PRIMARY_MODEL, media_type, image_b64, prompt)
-        except anthropic.OverloadedError:
-            # Our best model is still overloaded even after its own
-            # retries — rather than fail the request outright, try once
-            # more on a different model. It's usually served with separate
-            # capacity, so it can often succeed even when Opus can't.
-            app.logger.warning(
-                "Opus overloaded after retries, falling back to %s", FALLBACK_MODEL
-            )
-            message = call_model_with_retries(FALLBACK_MODEL, media_type, image_b64, prompt, retries=2)
-            used_fallback_model = True
-
-        # Opus sometimes returns a "thinking" block before the actual answer,
-        # so we look for the first block that's actually text instead of
-        # assuming it's content[0].
-        text = next(
-            (block.text for block in message.content if block.type == "text"),
-            None,
-        )
-        if text is None:
-            raise EmptyTranscriptionError("The model didn't return any readable text.")
+        message, used_fallback_model = read_with_fallback(
+            [image_block(media_type, image_b64), {"type": "text", "text": prompt}])
+        text = message_text(message)
     except Exception as exc:  # noqa: BLE001 — never show a raw technical error to a stranger
-        # The person sees a friendly message below, but we still need the
-        # REAL error somewhere so we can actually debug it — this prints
-        # the full technical error and traceback to Render's logs only,
-        # never to the visitor's screen.
-        if is_budget_error(exc):
-            app.logger.exception("Transcription failed [BUDGET]: %s", exc)
-            return render_template_string(
-                ERROR_PAGE,
-                budget=True,
-                title=BUDGET_ERROR_TITLE,
-                error=BUDGET_ERROR_MESSAGE,
-                contact_email=CONTACT_EMAIL,
-                kofi_url=KOFI_URL,
-            )
-        code = classify_error(exc)
-        app.logger.exception("Transcription failed [%s]: %s", code, exc)
-        return error_page(code)
+        return reading_failed(exc)
 
     # Rendered once, straight back into this response — never written to a
     # file, database, or log. It exists only in this one page load.
