@@ -97,10 +97,10 @@ limiter = Limiter(
 # Reject uploads bigger than 25 MB outright — generous enough for a real
 # phone photo (which we then shrink below), while still blocking anything
 # absurd.
-app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # room for several pages in one Premium upload
+app.config["MAX_CONTENT_LENGTH"] = 90 * 1024 * 1024  # room for several pages in one Premium upload
 
 # Premium "many pages at once": most pages in one go.
-MAX_PAGES = 10
+MAX_PAGES = 15
 
 # Handwriting doesn't need a 12-megapixel photo to be read accurately —
 # anything beyond this on the longest edge is wasted size and wasted money.
@@ -412,11 +412,11 @@ Use this context ONLY to choose between possible readings of unclear handwriting
 def split_pages(text: str, page_count: int) -> tuple[list[str] | None, str]:
     """Split a several-page answer into one text per page, plus the notes."""
     notes = ""
-    notes_match = re.search(r"^=== NOTES ===[ \t]*$", text, re.M)
+    notes_match = re.search(r"^[ \t*#_]*=+[ \t]*NOTES[ \t]*=+[ \t*#_:]*$", text, re.M | re.I)
     if notes_match:
         notes = text[notes_match.end():].strip()
         text = text[:notes_match.start()]
-    parts = re.split(r"^=== PAGE (\d+) ===[ \t]*$", text, flags=re.M)
+    parts = re.split(r"^[ \t*#_]*=+[ \t]*PAGE[ \t]+(\d+)[ \t]*=+[ \t*#_:]*$", text, flags=re.M | re.I)
     found = {}
     for i in range(1, len(parts) - 1, 2):
         found[int(parts[i])] = parts[i + 1].strip("\n")
@@ -840,7 +840,7 @@ UPLOAD_FORM = """
       ['dragleave', 'drop'].forEach(evt => pagesDrop.addEventListener(evt, (e) => { e.preventDefault(); pagesDrop.classList.remove('dragover'); }));
       pagesDrop.addEventListener('drop', (e) => addPages(e.dataTransfer.files));
 
-      protectForm(pagesForm, pagesBtn, 'Reading your pages... (about 20 seconds per page)', document.getElementById('pagesWake'), () => {
+      protectForm(pagesForm, pagesBtn, 'Reading your pages... (about 20 seconds per page, so a few minutes for a big batch)', document.getElementById('pagesWake'), () => {
         if (!pages.length) { alert('Please choose your page photos first.'); return false; }
         // Put the files into the form in exactly the order shown.
         const ordered = new DataTransfer();
@@ -895,7 +895,7 @@ RESULT_PAGE = """
 </head>
 <body>
 <div class="card">
-  <h1>Here's your text</h1>
+  <h1>All done! Your text is ready</h1>
   <p>Compare side by side to check the right words were matched to the right part of the page:</p>
   <div class="columns">
     <img src="data:{{ media_type }};base64,{{ image_b64 }}" alt="Your uploaded photo">
@@ -980,11 +980,13 @@ PAGES_RESULT = """
     .edit-box textarea { width: 100%; min-height: 220px; font-family: monospace; font-size: 0.95em; padding: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
     .edit-box button { margin-top: 8px; padding: 6px 14px; cursor: pointer; }
     .promise { color: #2a6f2a; font-size: 0.9em; }
+    .intro { color: #5a5048; margin-top: -6px; }
   </style>
 </head>
 <body>
 <div class="card">
-  <h1>Here are your {{ pages|length }} pages</h1>
+  <h1>All done! Your {{ pages|length }} pages are ready</h1>
+  <p class="intro">Have a look below. Anything highlighted is worth a quick check against the photo.</p>
   {% if notes %}<div class="notes"><strong>What the tool noticed</strong>{{ notes }}</div>{% endif %}
   {% if truncated %}<p class="warn">This was a lot of writing for one go, so the end may be cut off. If the last page looks incomplete, read it again on its own.</p>{% endif %}
   {% if used_fallback_model %}<p class="warn">Text recognition was briefly overloaded with demand, so the tool read these in backup mode. Worth a quick double-check.</p>{% endif %}
@@ -1005,7 +1007,7 @@ PAGES_RESULT = """
     <span id="copyStatus" style="font-size:0.85em; color:#2a6f2a; margin-left:8px;"></span>
   </div>
   <p class="promise" style="margin-top:24px;">These photos were never saved — they're only shown here, in your own browser, for this one page. Once you leave or refresh, they're gone for good.</p>
-  <a href="/#premium">Read more pages</a>
+  <a href="/#premium">Read more pages →</a>
   <script>
     document.getElementById('copyBtn').addEventListener('click', () => {
       navigator.clipboard.writeText(document.getElementById('editableText').value).then(() => {
@@ -1196,7 +1198,7 @@ ERRORS = {
         "The file may be damaged or in a format we can't read.",
         "Try again with a JPG or PNG. Taking a screenshot of the photo and uploading that usually works too."),
     "TOO_LARGE": ("photo", "That upload is too large",
-        "Uploads can be up to 60 MB in total, and this one is bigger.",
+        "Uploads can be up to 90 MB in total, and this one is bigger.",
         "Choose a smaller photo, or take a screenshot of it and upload that."),
     "LIMIT": ("wait", "Please slow down a little",
         "You've sent a lot of photos in a short time, so this free tool is pausing you briefly "
@@ -1571,7 +1573,7 @@ def transcribe_pages():
             for number, page in enumerate(pages, start=1):
                 content += [{"type": "text", "text": f"Page {number}:"}, image_block(page["media_type"], page["image_b64"])]
             content.append({"type": "text", "text": build_pages_prompt(len(pages), context_hint, follow_story=True)})
-            message, used_fallback = read_with_fallback(content, max_tokens=16000)
+            message, used_fallback = read_with_fallback(content, max_tokens=20000)
             texts, notes = split_pages(message_text(message), len(pages))
             truncated = message.stop_reason == "max_tokens"
             if texts is None:
