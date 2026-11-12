@@ -1490,7 +1490,7 @@ def unlock():
 #   MAIL_SCRIPT_URL          the web-app address of the Google Apps Script
 #                            that sends the emails (see send_key_email)
 #   MAIL_SCRIPT_SECRET       the same secret as written in that script
-KOFI_VERIFICATION_TOKEN = os.environ.get("KOFI_VERIFICATION_TOKEN", "")
+KOFI_VERIFICATION_TOKEN = os.environ.get("KOFI_VERIFICATION_TOKEN", "").strip()
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
 MAIL_SCRIPT_URL = os.environ.get("MAIL_SCRIPT_URL", "").strip()
 MAIL_SCRIPT_SECRET = os.environ.get("MAIL_SCRIPT_SECRET", "").strip()
@@ -1579,7 +1579,7 @@ def kofi_webhook():
         data = json.loads(request.form.get("data", ""))
     except ValueError:
         return "bad request", 400
-    if not hmac.compare_digest(str(data.get("verification_token", "")).encode(), KOFI_VERIFICATION_TOKEN.encode()):
+    if not hmac.compare_digest(str(data.get("verification_token", "")).strip().encode(), KOFI_VERIFICATION_TOKEN.encode()):
         app.logger.warning("Ko-fi: message with a wrong verification token was rejected")
         return "forbidden", 403
 
