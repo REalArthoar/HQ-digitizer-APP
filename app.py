@@ -40,8 +40,7 @@ import hmac
 import secrets
 import io
 import json
-import smtplib
-from email.message import EmailMessage
+import urllib.request
 import os
 import re
 import time
@@ -1486,11 +1485,15 @@ def unlock():
 #
 # Settings (in Render -> Environment):
 #   KOFI_VERIFICATION_TOKEN  from Ko-fi: More -> API -> Webhooks -> Advanced
-#   GMAIL_ADDRESS            the address keys are sent from
-#   GMAIL_APP_PASSWORD       that account's 16-letter app password
+#   GMAIL_ADDRESS            the address keys are sent from (for test emails
+#                            and replies)
+#   MAIL_SCRIPT_URL          the web-app address of the Google Apps Script
+#                            that sends the emails (see send_key_email)
+#   MAIL_SCRIPT_SECRET       the same secret as written in that script
 KOFI_VERIFICATION_TOKEN = os.environ.get("KOFI_VERIFICATION_TOKEN", "")
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+MAIL_SCRIPT_URL = os.environ.get("MAIL_SCRIPT_URL", "").strip()
+MAIL_SCRIPT_SECRET = os.environ.get("MAIL_SCRIPT_SECRET", "").strip()
 
 # Amount paid (in your Ko-fi currency) -> pass. Checked from the top, so
 # 10 or more gets a month, 5 or more a week, 1 or more a day.
@@ -1538,26 +1541,39 @@ Questions or problems? Just reply to this email.
 
 
 def send_key_email(to_address: str, name: str, pass_name: str, key: str, link: str, test: bool = False) -> None:
+    """Send the key email through a small Google Apps Script running in the
+    hqdigitizersupport Gmail account.
+
+    Render's free plan blocks the normal way of sending email (SMTP ports),
+    so instead the app asks that script, over ordinary web traffic, to send
+    the email from Gmail. The shared secret stops anyone else using it.
+    """
     until = nice_date(premium_key_expiry(key))
     fields = dict(name=name, pass_name=pass_name, until=until, key=key, link=link)
-    message = EmailMessage()
-    message["Subject"] = ("[TEST] " if test else "") + f"Your HQ Digitizer Premium pass ({pass_name})"
-    message["From"] = f"HQ Digitizer <{GMAIL_ADDRESS}>"
-    message["To"] = to_address
-    message["Reply-To"] = GMAIL_ADDRESS
-    message.set_content(render_template_string(KEY_EMAIL_TEXT, **fields))
-    message.add_alternative(render_template_string(KEY_EMAIL_HTML, **fields), subtype="html")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
-        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        smtp.send_message(message)
+    payload = json.dumps({
+        "secret": MAIL_SCRIPT_SECRET,
+        "to": to_address,
+        "subject": ("[TEST] " if test else "") + f"Your HQ Digitizer Premium pass ({pass_name})",
+        "text": render_template_string(KEY_EMAIL_TEXT, **fields),
+        "html": render_template_string(KEY_EMAIL_HTML, **fields),
+        "replyTo": GMAIL_ADDRESS,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        MAIL_SCRIPT_URL, data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        answer = response.read().decode("utf-8", "replace").strip()
+    if answer != "ok":
+        raise RuntimeError(f"mail script answered {answer[:80]!r}")
 
 
 @app.route("/kofi-webhook", methods=["POST"])
 def kofi_webhook():
     """Ko-fi calls this after every payment. We always answer 200 once the
     message is genuine, so Ko-fi doesn't keep resending it."""
-    if not (KOFI_VERIFICATION_TOKEN and PREMIUM_KEY_SECRET and GMAIL_ADDRESS and GMAIL_APP_PASSWORD):
-        app.logger.error("Ko-fi: payment message arrived, but Ko-fi/Gmail settings are missing in Render")
+    if not (KOFI_VERIFICATION_TOKEN and PREMIUM_KEY_SECRET and GMAIL_ADDRESS and MAIL_SCRIPT_URL and MAIL_SCRIPT_SECRET):
+        app.logger.error("Ko-fi: payment message arrived, but Ko-fi/email settings are missing in Render")
         return "not set up", 503
     try:
         data = json.loads(request.form.get("data", ""))
