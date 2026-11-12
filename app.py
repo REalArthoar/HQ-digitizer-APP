@@ -39,6 +39,9 @@ import hashlib
 import hmac
 import secrets
 import io
+import json
+import smtplib
+from email.message import EmailMessage
 import os
 import re
 import time
@@ -1473,6 +1476,132 @@ def unlock():
         httponly=True, secure=request.is_secure, samesite="Lax",
     )
     return response
+
+
+# ------------------------------------------------- Ko-fi -> automatic keys
+# When someone pays on Ko-fi, Ko-fi sends a message to /kofi-webhook. We
+# check it really came from Ko-fi, pick the pass from the amount paid, make
+# a key and email it straight to the supporter. Nothing is stored: their
+# email address is used once to send the key and then forgotten.
+#
+# Settings (in Render -> Environment):
+#   KOFI_VERIFICATION_TOKEN  from Ko-fi: More -> API -> Webhooks -> Advanced
+#   GMAIL_ADDRESS            the address keys are sent from
+#   GMAIL_APP_PASSWORD       that account's 16-letter app password
+KOFI_VERIFICATION_TOKEN = os.environ.get("KOFI_VERIFICATION_TOKEN", "")
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+
+# Amount paid (in your Ko-fi currency) -> pass. Checked from the top, so
+# 10 or more gets a month, 5 or more a week, 1 or more a day.
+PASS_PRICES = [(10, "1 month"), (5, "7 days"), (1, "1 day")]
+
+# Ko-fi may send the same message twice; remember recent ones so nobody
+# gets two keys for one payment. (Only Ko-fi's message ids, kept in memory.)
+_seen_kofi_messages: list[str] = []
+
+
+def pass_for_amount(amount: float) -> str | None:
+    for price, pass_name in PASS_PRICES:
+        if amount >= price:
+            return pass_name
+    return None
+
+
+KEY_EMAIL_HTML = """<!doctype html>
+<html><body style="margin:0; padding:24px; background:#efe7da; font-family:Arial, Helvetica, sans-serif; color:#2b2724;">
+  <div style="max-width:520px; margin:0 auto; background:#fffdf9; border-radius:14px; padding:28px; border:1px solid #e6dccb;">
+    <h1 style="font-size:22px; margin:0 0 12px;">Thank you for your support{% if name %}, {{ name }}{% endif %}! 💛</h1>
+    <p style="font-size:15px; line-height:1.5;">Your <strong>{{ pass_name }}</strong> Premium pass for HQ Digitizer is ready. It's valid until <strong>{{ until }}</strong>.</p>
+    <p style="text-align:center; margin:26px 0;">
+      <a href="{{ link }}" style="background:#2a6f2a; color:#ffffff; text-decoration:none; font-weight:bold; padding:13px 26px; border-radius:8px; display:inline-block;">Unlock Premium</a>
+    </p>
+    <p style="font-size:14px; line-height:1.5;">Press the button on each device you want to use, for example your phone and your computer.</p>
+    <p style="font-size:14px; line-height:1.5;">Your key, in case you need it:</p>
+    <p style="font-family:Consolas, Menlo, monospace; font-size:15px; background:#f7f2ea; padding:12px; border-radius:8px; word-break:break-all;">{{ key }}</p>
+    <p style="font-size:13px; color:#6b5d4d; line-height:1.5;">Questions or problems? Just reply to this email.</p>
+  </div>
+</body></html>"""
+
+KEY_EMAIL_TEXT = """Thank you for your support{% if name %}, {{ name }}{% endif %}!
+
+Your {{ pass_name }} Premium pass for HQ Digitizer is ready. It's valid until {{ until }}.
+
+Unlock Premium (open this link on each device you want to use):
+{{ link }}
+
+Your key, in case you need it:
+{{ key }}
+
+Questions or problems? Just reply to this email.
+"""
+
+
+def send_key_email(to_address: str, name: str, pass_name: str, key: str, link: str, test: bool = False) -> None:
+    until = nice_date(premium_key_expiry(key))
+    fields = dict(name=name, pass_name=pass_name, until=until, key=key, link=link)
+    message = EmailMessage()
+    message["Subject"] = ("[TEST] " if test else "") + f"Your HQ Digitizer Premium pass ({pass_name})"
+    message["From"] = f"HQ Digitizer <{GMAIL_ADDRESS}>"
+    message["To"] = to_address
+    message["Reply-To"] = GMAIL_ADDRESS
+    message.set_content(render_template_string(KEY_EMAIL_TEXT, **fields))
+    message.add_alternative(render_template_string(KEY_EMAIL_HTML, **fields), subtype="html")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        smtp.send_message(message)
+
+
+@app.route("/kofi-webhook", methods=["POST"])
+def kofi_webhook():
+    """Ko-fi calls this after every payment. We always answer 200 once the
+    message is genuine, so Ko-fi doesn't keep resending it."""
+    if not (KOFI_VERIFICATION_TOKEN and PREMIUM_KEY_SECRET and GMAIL_ADDRESS and GMAIL_APP_PASSWORD):
+        app.logger.error("Ko-fi: payment message arrived, but Ko-fi/Gmail settings are missing in Render")
+        return "not set up", 503
+    try:
+        data = json.loads(request.form.get("data", ""))
+    except ValueError:
+        return "bad request", 400
+    if not hmac.compare_digest(str(data.get("verification_token", "")).encode(), KOFI_VERIFICATION_TOKEN.encode()):
+        app.logger.warning("Ko-fi: message with a wrong verification token was rejected")
+        return "forbidden", 403
+
+    message_id = str(data.get("message_id", ""))
+    if message_id and message_id in _seen_kofi_messages:
+        return "already handled", 200
+    _seen_kofi_messages.append(message_id)
+    del _seen_kofi_messages[:-200]
+
+    try:
+        amount = float(data.get("amount") or 0)
+    except ValueError:
+        amount = 0
+    pass_name = pass_for_amount(amount)
+    if not pass_name:
+        app.logger.info("Ko-fi: payment of %s %s is below the cheapest pass, no key sent", amount, data.get("currency"))
+        return "ok", 200
+
+    email = str(data.get("email") or "").strip()
+    name = str(data.get("from_name") or "").strip()[:60]
+    # Ko-fi's "Send test" uses a made-up example address; send those to our
+    # own inbox instead, so the whole flow can be tried without a real payment.
+    test = not email or email.lower().endswith("@example.com")
+    if test:
+        email = GMAIL_ADDRESS
+
+    key = make_premium_key(PASSES[pass_name])
+    link = request.host_url + "unlock?key=" + key
+    try:
+        send_key_email(email, name, pass_name, key, link, test=test)
+        app.logger.info("Ko-fi: sent a %s key (%s %s)%s", pass_name, amount, data.get("currency"), " [test]" if test else "")
+    except Exception as exc:  # noqa: BLE001
+        # Only on failure do we log the address, so you can send the key by hand.
+        app.logger.error(
+            "Ko-fi: KEY EMAIL FAILED (%s). Make a %s key on /admin and send it to %s by hand.",
+            exc, pass_name, email,
+        )
+    return "ok", 200
 
 
 @app.route("/admin", methods=["GET", "POST"])
